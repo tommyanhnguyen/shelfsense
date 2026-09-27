@@ -7,40 +7,89 @@
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <header>
-    <div>
-      <p class="eyebrow">SIT314 operations</p>
-      <h1>ShelfSense</h1>
+  <div id="signin" class="signin" hidden>
+    <div class="signin-card">
+      <div class="brand brand-large">
+        <span class="logo" aria-hidden="true"></span>
+        <div><strong>ShelfSense</strong><span>Store operations</span></div>
+      </div>
+      <h1>Sign in</h1>
+      <p id="signin-message" class="muted">Run this on your computer, then open the link it prints. One link signs you in as manager, supplier and driver for one hour.</p>
+      <pre class="command">./aws/setup.sh portal</pre>
+      <details>
+        <summary>Paste a token instead</summary>
+        <form id="token-form" class="token-form">
+          <textarea id="token-input" rows="3" autocomplete="off" spellcheck="false" placeholder="Token from ./aws/setup.sh token manager '*'"></textarea>
+          <button type="submit">Sign in</button>
+        </form>
+      </details>
     </div>
-    <button id="refresh">Refresh data</button>
-  </header>
+  </div>
 
-  <section aria-label="API access">
-    <label for="auth-token">Role token</label>
-    <input id="auth-token" type="password" autocomplete="off" placeholder="Paste a manager, supplier or driver token">
-    <button id="use-token" type="button">Use token</button>
-  </section>
+  <div id="app" class="app" hidden>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true"></span>
+        <div><strong>ShelfSense</strong><span>Store operations</span></div>
+      </div>
+      <div class="roles" role="group" aria-label="Acting as">
+        <button type="button" data-role="manager">Manager</button>
+        <button type="button" data-role="supplier">Supplier</button>
+        <button type="button" data-role="driver">Driver</button>
+      </div>
+      <div class="session">
+        <span class="live"><span class="dot" aria-hidden="true"></span><span id="updated">Connecting</span></span>
+        <button type="button" id="refresh" class="ghost">Refresh</button>
+        <button type="button" id="signout" class="ghost">Sign out</button>
+      </div>
+    </header>
 
-  <main>
-    <section>
-      <h2>Stock</h2>
-      <div id="stock" class="cards"></div>
+    <section class="kpis" aria-label="Summary">
+      <button type="button" class="kpi" data-goto="stock"><span class="kpi-label">Low stock</span><strong id="kpi-stock">0</strong><span class="kpi-note">under 3 days of cover</span></button>
+      <button type="button" class="kpi" data-goto="orders"><span class="kpi-label">Awaiting approval</span><strong id="kpi-orders">0</strong><span class="kpi-note">orders for the manager</span></button>
+      <button type="button" class="kpi" data-goto="deliveries"><span class="kpi-label">Deliveries open</span><strong id="kpi-deliveries">0</strong><span class="kpi-note">draft, planned or on the road</span></button>
+      <button type="button" class="kpi" data-goto="alerts"><span class="kpi-label">Cold-chain breaches</span><strong id="kpi-alerts">0</strong><span class="kpi-note">fridges above the limit</span></button>
     </section>
-    <section>
-      <h2>Pending orders</h2>
-      <div id="orders" class="cards"></div>
-    </section>
-    <section>
-      <h2>Cold-chain alerts</h2>
-      <div id="alerts" class="cards"></div>
-    </section>
-    <section>
-      <h2>Supplier and driver deliveries</h2>
-      <div id="deliveries" class="cards"></div>
-    </section>
-  </main>
 
-  <p id="status" role="status"></p>
+    <nav class="tabs" aria-label="Sections">
+      <button type="button" data-tab="stock">Stock <span class="count" id="count-stock"></span></button>
+      <button type="button" data-tab="orders">Orders <span class="count" id="count-orders"></span></button>
+      <button type="button" data-tab="deliveries">Deliveries <span class="count" id="count-deliveries"></span></button>
+      <button type="button" data-tab="alerts">Cold chain <span class="count" id="count-alerts"></span></button>
+    </nav>
+
+    <main>
+      <section class="panel" id="panel-stock" data-panel="stock">
+        <div class="toolbar">
+          <input id="stock-search" type="search" placeholder="Search store or product" autocomplete="off">
+          <select id="stock-store" aria-label="Store"><option value="">All stores</option></select>
+          <span class="hint">Sorted by days of cover, lowest first</span>
+        </div>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Store</th><th>Product</th><th class="num">On shelf</th><th class="num">Sold per day</th><th>Days of cover</th></tr></thead>
+            <tbody id="stock-rows"></tbody>
+          </table>
+          <p class="empty" id="stock-empty" hidden></p>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-orders" data-panel="orders">
+        <div class="toolbar chips" id="order-filters"></div>
+        <div class="scroll list" id="order-list"></div>
+      </section>
+
+      <section class="panel" id="panel-deliveries" data-panel="deliveries">
+        <div class="board" id="board"></div>
+      </section>
+
+      <section class="panel" id="panel-alerts" data-panel="alerts">
+        <div class="scroll list" id="alert-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
   <script src="/app.js"></script>
 </body>
 </html>

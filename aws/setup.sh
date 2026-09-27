@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ShelfSense on AWS Learner Lab. Run from anywhere: ./aws/setup.sh <step>
 # Steps in order: secrets, check, messaging, network, db, core, edge, workers, demo.
-# Experiment: scale, load, results. Evidence: security. Other: status, token, tunnel, logs, update, teardown.
+# Experiment: scale, load, results. Evidence: security. Other: status, portal, token, tunnel, logs, update, teardown.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -332,7 +332,7 @@ cmd_scale() {
 cmd_demo() {
   say "Small demo through AWS: 2 stores, shelves, POS and fridges"
   on edge 'sudo docker run --rm --network shelfsense --env-file /opt/shelfsense/app.env -e MQTT_URL=mqtt://broker:1883 shelfsense node src/workload.js demo'
-  ok "open $(get ALB_URL) and use ./aws/setup.sh token manager '*' to sign in"
+  ok "now run ./aws/setup.sh portal to open the portal"
 }
 
 cmd_load() {
@@ -479,6 +479,21 @@ JSEOF
       --attribute-names SqsManagedSseEnabled --query 'Attributes.SqsManagedSseEnabled' --output text)"
   done
 }
+cmd_portal() {
+  # One sign-in link for manager, supplier and driver. The tokens sit after '#', so the browser
+  # keeps them and never sends them to the ALB. The portal moves them to sessionStorage at once.
+  local alb key link role
+  alb=$(need ALB_URL core); key=$(secret API_AUTH_SECRET)
+  [ -n "$key" ] || fail "API_AUTH_SECRET is missing, run ./aws/setup.sh secrets first"
+  link="$alb/#"
+  for role in manager supplier driver; do
+    link="$link$role=$(API_AUTH_SECRET="$key" node src/shared/auth.js "$role" '*')&"
+  done
+  link=${link%&}
+  say "Portal sign-in link, valid for 1 hour"
+  if command -v open >/dev/null 2>&1; then open "$link"; ok "opened $alb in your browser"
+  else echo "   $link"; fi
+}
 cmd_status() {
   say "Status"
   echo "   portal: $(get ALB_URL)"
@@ -560,6 +575,6 @@ cmd_teardown() {
 step=${1:-help}
 shift || true
 case "$step" in
-  check|secrets|messaging|network|db|core|edge|workers|scale|demo|load|results|security|status|token|tunnel|logs|update|teardown) "cmd_$step" "$@" ;;
+  check|secrets|messaging|network|db|core|edge|workers|scale|demo|load|results|security|status|portal|token|tunnel|logs|update|teardown) "cmd_$step" "$@" ;;
   *) sed -n '2,4p' "$0" | sed 's/^# //'; exit 1 ;;
 esac
