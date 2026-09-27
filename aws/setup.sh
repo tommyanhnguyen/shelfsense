@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ShelfSense on AWS Learner Lab. Run from anywhere: ./aws/setup.sh <step>
 # Steps in order: secrets, check, messaging, network, db, core, edge, workers, demo.
-# Experiment: scale, load, results. Other: status, token, tunnel, logs, update, teardown.
+# Experiment: scale, load, results. Evidence: security. Other: status, token, tunnel, logs, update, teardown.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -377,6 +377,108 @@ JSEOF
   on db 'sudo docker cp /tmp/results.js mongo:/tmp/results.js && sudo docker exec mongo sh -c "mongosh --quiet -u shelfsense -p \"\$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin shelfsense /tmp/results.js"'
 }
 
+cmd_security() {
+  # Evidence for the report: each check tries something an attacker would try and shows it is refused.
+  local alb edge db core
+  alb=$(need ALB_URL core); edge=$(public_ip edge); db=$(public_ip db); core=$(public_ip core)
+
+  say "1. API: the portal rejects missing, forged and out-of-scope tokens"
+  ALB="$alb" API_AUTH_SECRET="$(secret API_AUTH_SECRET)" node - <<'JSEOF'
+const { createRoleToken, issueToken } = require('./src/shared/auth');
+const secret = process.env.API_AUTH_SECRET;
+const base = process.env.ALB;
+const manager = createRoleToken({ role: 'manager', stores: '*', secret });
+const call = async (label, path, token, method = 'GET') => {
+  const headers = { 'content-type': 'application/json' };
+  if (token) headers.authorization = 'Bearer ' + token;
+  const res = await fetch(base + path, { method, headers, body: method === 'POST' ? '{"approvedBy":"tester"}' : undefined });
+  const body = await res.json().catch(() => ({}));
+  const detail = Array.isArray(body) ? body.length + ' rows' : (body.error || body.status || '');
+  console.log('   ' + String(res.status).padEnd(5) + label.padEnd(52) + detail);
+  return body;
+};
+(async () => {
+  await call('GET /api/stock with no token', '/api/stock');
+  await call('GET /api/stock with a token signed by a wrong key', '/api/stock',
+    issueToken({ role: 'manager', stores: '*' }, 'attacker-guessed-secret-000000000000'));
+  const orders = await call('GET /api/orders as manager (allowed)', '/api/orders', manager);
+  const order = Array.isArray(orders) ? orders[0] : null;
+  if (!order) { console.log('   (no order yet, run ./aws/setup.sh demo first for the 403 checks)'); return; }
+  const path = '/api/orders/' + encodeURIComponent(order.orderId) + '/approve';
+  await call('approve order as a driver (wrong role)', path,
+    createRoleToken({ role: 'driver', stores: '*', secret }), 'POST');
+  const other = order.store === 'store-99' ? 'store-98' : 'store-99';
+  await call('approve ' + order.store + ' order as manager of ' + other, path,
+    createRoleToken({ role: 'manager', stores: other, secret }), 'POST');
+})().catch(error => { console.error('   ' + error.message); process.exitCode = 1; });
+JSEOF
+
+  say "2. MQTT login, then 3. tampered and unsigned events (bridge sends them to dead-letter, not SNS)"
+  on edge 'sudo docker run --rm -i --network shelfsense --env-file /opt/shelfsense/app.env -e MQTT_URL=mqtt://broker:1883 shelfsense node -' <<'JSEOF'
+const { connectMqtt } = require('./src/shared/transport');
+const { createEvent, signEvent } = require('./src/shared/events');
+const url = process.env.MQTT_URL;
+const tryLogin = async (label, username, password) => {
+  try {
+    const client = await connectMqtt(url, 'security-' + Date.now(), { username, password, reconnectPeriod: 0 });
+    console.log('   ACCEPTED  ' + label); client.end(true);
+  } catch (error) { console.log('   REFUSED   ' + label.padEnd(34) + error.message); }
+};
+(async () => {
+  await tryLogin('wrong password', 'shelfsense', 'wrong-password');
+  await tryLogin('no username or password', undefined, undefined);
+  await tryLogin('correct password (control)', process.env.MQTT_USERNAME, process.env.MQTT_PASSWORD);
+  console.log('');
+  const client = await connectMqtt(url, 'security-' + Date.now(), { reconnectPeriod: 0 });
+  await new Promise(resolve => client.subscribe('shelfsense/dead-letter', { qos: 1 }, resolve));
+  const seen = [];
+  client.on('message', (topic, payload) => {
+    const row = JSON.parse(payload.toString());
+    if (row.payload.includes('security-check')) seen.push(row);
+  });
+  const signed = signEvent(createEvent('stock.delta', 'store-1',
+    { skuId: 'milk-1l', delta: -1, source: 'shelf', note: 'security-check' }), process.env.EVENT_SIGNING_SECRET);
+  const tampered = structuredClone(signed); tampered.data.delta = -500;
+  const unsigned = structuredClone(signed); delete unsigned.signature;
+  client.publish('shelfsense/events/stock.delta', JSON.stringify(tampered), { qos: 1 });
+  client.publish('shelfsense/events/stock.delta', JSON.stringify(unsigned), { qos: 1 });
+  await new Promise(resolve => setTimeout(resolve, 3000));
+  console.log('   sent: delta changed from -1 to -500 after signing, and one event with no signature');
+  for (const row of seen) console.log('   DEAD-LETTER  ' + row.sourceTopic + '  reason: ' + row.reason);
+  if (seen.length !== 2) console.log('   expected 2 dead-letter messages, saw ' + seen.length);
+  client.end(true);
+})().catch(error => { console.error('   ' + error.message); process.exitCode = 1; });
+JSEOF
+
+  say "4. Network: internal ports are closed to the internet"
+  EDGE="$edge" DB="$db" CORE="$core" node - <<'JSEOF'
+const net = require('node:net');
+const probe = (label, host, port) => new Promise(resolve => {
+  const socket = net.connect({ host, port });
+  const done = result => { socket.destroy(); console.log('   ' + result.padEnd(9) + label + ' (' + host + ':' + port + ')'); resolve(); };
+  socket.setTimeout(4000, () => done('BLOCKED'));
+  socket.once('connect', () => done('OPEN'));
+  socket.once('error', () => done('BLOCKED'));
+});
+(async () => {
+  await probe('MQTT broker on edge', process.env.EDGE, 1883);
+  await probe('Node-RED editor on edge', process.env.EDGE, 1880);
+  await probe('MongoDB on db', process.env.DB, 27017);
+  await probe('API directly on core, bypassing the ALB', process.env.CORE, 3000);
+})();
+JSEOF
+
+  say "5. Secrets and encryption at rest"
+  aws ssm describe-parameters --parameter-filters "Key=Name,Option=BeginsWith,Values=/$P/" \
+    --query 'Parameters[].[Name,Type]' --output text | awk '{print "   " $2 "  " $1}'
+  local pair name url
+  for pair in $QUEUES; do
+    name=${pair%%:*}
+    url=$(get "SQS_$(echo "$name" | tr '[:lower:]' '[:upper:]')_QUEUE_URL")
+    [ -z "$url" ] || echo "   SQS $P-$name  SqsManagedSseEnabled=$(aws sqs get-queue-attributes --queue-url "$url" \
+      --attribute-names SqsManagedSseEnabled --query 'Attributes.SqsManagedSseEnabled' --output text)"
+  done
+}
 cmd_status() {
   say "Status"
   echo "   portal: $(get ALB_URL)"
@@ -458,6 +560,6 @@ cmd_teardown() {
 step=${1:-help}
 shift || true
 case "$step" in
-  check|secrets|messaging|network|db|core|edge|workers|scale|demo|load|results|status|token|tunnel|logs|update|teardown) "cmd_$step" "$@" ;;
+  check|secrets|messaging|network|db|core|edge|workers|scale|demo|load|results|security|status|token|tunnel|logs|update|teardown) "cmd_$step" "$@" ;;
   *) sed -n '2,4p' "$0" | sed 's/^# //'; exit 1 ;;
 esac
