@@ -1,0 +1,33 @@
+{
+  "name": "shelfsense",
+  "version": "1.0.0",
+  "description": "Scalable IoT stock management and delivery system for SIT314",
+  "main": "src/api.js",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "broker": "node src/broker.js",
+    "api": "node src/api.js",
+    "inventory": "SERVICE_NAME=inventory node src/service.js",
+    "replenishment": "SERVICE_NAME=replenishment node src/service.js",
+    "cold-chain": "SERVICE_NAME=cold-chain node src/service.js",
+    "delivery": "SERVICE_NAME=delivery node src/service.js",
+    "dead-letter": "SERVICE_NAME=dead-letter node src/service.js",
+    "simulator": "node src/workload.js demo",
+    "workload": "node src/workload.js",
+    "auth-token": "node src/shared/auth.js",
+    "node-red": "npx --yes node-red@4.0.9 --userDir node-red",
+    "watch": "mqtt sub -t \"shelfsense/#\" -h localhost -v"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "author": "Tommy Nguyen 224345482",
+  "license": "ISC",
+  "dependencies": {
+    "@aws-sdk/client-sns": "3.1141.0",
+    "@aws-sdk/client-sqs": "3.1141.0",
+    "aedes": "^1.1.2",
+    "mongoose": "^8.9.5",
+    "mqtt": "^5.10.1"
+  }
+}

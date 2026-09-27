@@ -1,0 +1,188 @@
+[
+  {
+    "id": "shelfsense-flow",
+    "type": "tab",
+    "label": "ShelfSense edge processing",
+    "disabled": false,
+    "info": "Validates raw store input and publishes business events."
+  },
+  {
+    "id": "local-broker",
+    "type": "mqtt-broker",
+    "name": "ShelfSense broker",
+    "broker": "${MQTT_HOST}",
+    "port": "${MQTT_PORT}",
+    "clientid": "node-red-edge",
+    "autoConnect": true,
+    "usetls": false,
+    "protocolVersion": "4",
+    "keepalive": "60",
+    "cleansession": true,
+    "autoUnsubscribe": true
+  },
+  {
+    "id": "raw-shelf",
+    "type": "mqtt in",
+    "z": "shelfsense-flow",
+    "name": "Raw shelf readings",
+    "topic": "shelfsense/raw/+/shelf/+",
+    "qos": "1",
+    "datatype": "utf8",
+    "broker": "local-broker",
+    "nl": false,
+    "rap": true,
+    "rh": 0,
+    "inputs": 0,
+    "x": 160,
+    "y": 100,
+    "wires": [
+      [
+        "process-shelf"
+      ]
+    ]
+  },
+  {
+    "id": "raw-pos",
+    "type": "mqtt in",
+    "z": "shelfsense-flow",
+    "name": "Raw POS sales",
+    "topic": "shelfsense/raw/+/pos",
+    "qos": "1",
+    "datatype": "utf8",
+    "broker": "local-broker",
+    "nl": false,
+    "rap": true,
+    "rh": 0,
+    "inputs": 0,
+    "x": 150,
+    "y": 180,
+    "wires": [
+      [
+        "process-pos"
+      ]
+    ]
+  },
+  {
+    "id": "raw-fridge",
+    "type": "mqtt in",
+    "z": "shelfsense-flow",
+    "name": "Raw fridge readings",
+    "topic": "shelfsense/raw/+/fridge/+",
+    "qos": "1",
+    "datatype": "utf8",
+    "broker": "local-broker",
+    "nl": false,
+    "rap": true,
+    "rh": 0,
+    "inputs": 0,
+    "x": 160,
+    "y": 260,
+    "wires": [
+      [
+        "process-temperature"
+      ]
+    ]
+  },
+  {
+    "id": "process-shelf",
+    "type": "function",
+    "z": "shelfsense-flow",
+    "name": "Settle shelf reading",
+    "func": "const sourceTopic = msg.topic;\nconst raw = msg.payload;\ntry {\n  const reading = typeof raw === 'string' ? JSON.parse(raw) : raw;\n  const processor = global.get('edgeProcessor');\n  const event = processor.processShelf(reading);\n  const save = global.get('saveEdgeState');\n  if (save) save(processor.snapshot());\n  if (!event) return null;\n  msg.topic = 'shelfsense/events/' + event.type;\n  const sign = global.get('signBusinessEvent');\n  msg.payload = JSON.stringify(sign ? sign(event) : event);\n  return [msg, null];\n} catch (error) {\n  msg.topic = 'shelfsense/dead-letter';\n  msg.payload = JSON.stringify({ sourceTopic, reason: error.message, payload: raw, ts: Date.now() });\n  return [null, msg];\n}",
+    "outputs": 2,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 430,
+    "y": 100,
+    "wires": [
+      [
+        "business-output"
+      ],
+      [
+        "dead-letter-output"
+      ]
+    ]
+  },
+  {
+    "id": "process-pos",
+    "type": "function",
+    "z": "shelfsense-flow",
+    "name": "Convert POS sale",
+    "func": "const sourceTopic = msg.topic;\nconst raw = msg.payload;\ntry {\n  const reading = typeof raw === 'string' ? JSON.parse(raw) : raw;\n  const event = global.get('edgeProcessor').processPos(reading);\n  msg.topic = 'shelfsense/events/' + event.type;\n  const sign = global.get('signBusinessEvent');\n  msg.payload = JSON.stringify(sign ? sign(event) : event);\n  return [msg, null];\n} catch (error) {\n  msg.topic = 'shelfsense/dead-letter';\n  msg.payload = JSON.stringify({ sourceTopic, reason: error.message, payload: raw, ts: Date.now() });\n  return [null, msg];\n}",
+    "outputs": 2,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 420,
+    "y": 180,
+    "wires": [
+      [
+        "business-output"
+      ],
+      [
+        "dead-letter-output"
+      ]
+    ]
+  },
+  {
+    "id": "process-temperature",
+    "type": "function",
+    "z": "shelfsense-flow",
+    "name": "Filter temperature",
+    "func": "const sourceTopic = msg.topic;\nconst raw = msg.payload;\ntry {\n  const reading = typeof raw === 'string' ? JSON.parse(raw) : raw;\n  const processor = global.get('edgeProcessor');\n  const event = processor.processTemperature(reading);\n  const save = global.get('saveEdgeState');\n  if (save) save(processor.snapshot());\n  if (!event) return null;\n  msg.topic = 'shelfsense/events/' + event.type;\n  const sign = global.get('signBusinessEvent');\n  msg.payload = JSON.stringify(sign ? sign(event) : event);\n  return [msg, null];\n} catch (error) {\n  msg.topic = 'shelfsense/dead-letter';\n  msg.payload = JSON.stringify({ sourceTopic, reason: error.message, payload: raw, ts: Date.now() });\n  return [null, msg];\n}",
+    "outputs": 2,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 430,
+    "y": 260,
+    "wires": [
+      [
+        "business-output"
+      ],
+      [
+        "dead-letter-output"
+      ]
+    ]
+  },
+  {
+    "id": "business-output",
+    "type": "mqtt out",
+    "z": "shelfsense-flow",
+    "name": "Business events",
+    "topic": "",
+    "qos": "1",
+    "retain": "false",
+    "respTopic": "",
+    "contentType": "application/json",
+    "userProps": "",
+    "correl": "",
+    "expiry": "",
+    "broker": "local-broker",
+    "x": 730,
+    "y": 160,
+    "wires": []
+  },
+  {
+    "id": "dead-letter-output",
+    "type": "mqtt out",
+    "z": "shelfsense-flow",
+    "name": "Rejected input",
+    "topic": "shelfsense/dead-letter",
+    "qos": "1",
+    "retain": "false",
+    "respTopic": "",
+    "contentType": "application/json",
+    "userProps": "",
+    "correl": "",
+    "expiry": "",
+    "broker": "local-broker",
+    "x": 730,
+    "y": 240,
+    "wires": []
+  }
+]

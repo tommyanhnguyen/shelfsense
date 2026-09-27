@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ShelfSense</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">SIT314 operations</p>
+      <h1>ShelfSense</h1>
+    </div>
+    <button id="refresh">Refresh data</button>
+  </header>
+
+  <section aria-label="API access">
+    <label for="auth-token">Role token</label>
+    <input id="auth-token" type="password" autocomplete="off" placeholder="Paste a manager, supplier or driver token">
+    <button id="use-token" type="button">Use token</button>
+  </section>
+
+  <main>
+    <section>
+      <h2>Stock</h2>
+      <div id="stock" class="cards"></div>
+    </section>
+    <section>
+      <h2>Pending orders</h2>
+      <div id="orders" class="cards"></div>
+    </section>
+    <section>
+      <h2>Cold-chain alerts</h2>
+      <div id="alerts" class="cards"></div>
+    </section>
+    <section>
+      <h2>Supplier and driver deliveries</h2>
+      <div id="deliveries" class="cards"></div>
+    </section>
+  </main>
+
+  <p id="status" role="status"></p>
+  <script src="/app.js"></script>
+</body>
+</html>
