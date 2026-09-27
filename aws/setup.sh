@@ -412,7 +412,9 @@ cmd_logs() {
 cmd_update() {
   local role=${1:?usage: ./aws/setup.sh update <db|core|edge|worker>}
   say "Updating $role: pull the latest commit from GitHub and restart its containers"
-  on "$role" 'sudo bash /var/lib/cloud/instance/user-data.txt && sudo tail -n 3 /var/log/shelfsense.log'
+  # Keep the export header from the original user data, but run the user-data.sh body from the
+  # freshly pulled repo, so a change to how containers start takes effect on a running machine.
+  on "$role" 'sudo bash -c "set -e; cd /opt/shelfsense/app && git pull --ff-only -q; { grep \"^export \" /var/lib/cloud/instance/user-data.txt; tail -n +2 aws/user-data.sh; } > /opt/shelfsense/update.sh; bash /opt/shelfsense/update.sh" && sudo tail -n 1 /var/log/shelfsense.log && sudo docker ps --format "{{.Names}}: {{.Command}}"'
   ok "$role updated"
 }
 
