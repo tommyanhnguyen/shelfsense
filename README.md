@@ -1,36 +1,94 @@
 # ShelfSense
 
-ShelfSense is the SIT314 IoT Distinction project. It tracks shelf stock and fridge temperature in supermarkets, predicts when a product will run out, creates supplier orders, and plans delivery routes. It uses Node.js, MQTT, Node-RED, MongoDB and AWS.
+ShelfSense is an event-driven IoT system for supermarkets. It watches shelf weight, till sales and fridge temperature, predicts when a product will run out, raises supplier orders, and plans delivery routes. It runs locally with Docker and on AWS with an Auto Scaling Group that grows with the event backlog.
+
+Built for SIT314 (Software Architecture and Scalability for IoT), Deakin University, by Tommy Nguyen.
+
+**Stack:** Node.js 22, MQTT (Aedes), Node-RED 4, MongoDB 7, Amazon SNS and SQS, EC2 Auto Scaling, Application Load Balancer, CloudWatch.
+
+## Results on AWS
+
+The same load was sent twice: 400 shelf readings per second for 90 seconds, which is 18,500 stock events after edge filtering. The first run used one inventory worker. The second let the Auto Scaling Group add workers when the SQS backlog passed 300 messages.
+
+| Measure | 1 worker | Auto scaling (up to 4) | Change |
+| --- | --- | --- | --- |
+| Events processed | 18,500 | 18,500 | none lost in either run |
+| Time to drain the backlog | 447 s | 334 s | 25% faster |
+| Throughput | 41.3 events/s | 55.4 events/s | 34% higher |
+| p95 latency | 340 s | 242 s | 29% lower |
+| Peak worker CPU | about 21% | about 21% | workers wait on I/O, not CPU |
+
+The alarm added workers 1 to 3, then 3 to 4, and each new instance took about two minutes to start. When the queue emptied, a second alarm removed workers down to one. CPU stayed low in every run, so the service scales on queue depth: a CPU alarm would never have fired.
+
+## Architecture
+
+```text
+EC2 edge   simulated sensors → MQTT broker → Node-RED edge logic → bridge
+                                                                     │ signed events
+                                                                     ▼
+AWS        SNS topic shelfsense-events, filtered by event type
+             ├─ SQS inventory      → inventory workers (Auto Scaling Group, 1 to 4)
+             ├─ SQS replenishment  ┐
+             ├─ SQS coldchain      ├─ services on EC2 core
+             └─ SQS delivery       ┘
+           each queue has a dead-letter queue and server-side encryption
+
+EC2 core   API and portal, reachable only through the ALB on port 80
+EC2 db     MongoDB, reachable only from core and the workers
+```
+
+Only inventory scales, because it receives almost every event. SQS hands each message to one worker, so a new worker takes its share at once. MQTT 3.1.1 has no shared subscriptions, which is why the edge hands events to SNS instead of feeding workers directly. MongoDB runs on EC2 because the Atlas free tier allows 100 operations per second and each stock event needs about five.
 
 ## How an event moves
 
-```text
-src/workload.js          simulated shelves, tills and fridges publish raw MQTT readings
-  → node-red/            flows.json calls edge.js: shelf debounce, POS dedup, fridge breach
-  → shelfsense/events/*  signed business events (HMAC)
-  → src/service.js       runs one service: MQTT locally, SQS on AWS
-  → src/services/        inventory → replenishment → delivery, and cold-chain
-  → MongoDB              stock_events, stock_levels, orders, deliveries, coldchain
-  → src/api.js           API with role tokens, portal in public/
-```
+1. **Edge (Node-RED).** A new shelf creates an opening stock event. Later weight changes must be stable across two readings before they count, which removes noise from a customer picking up and putting back a product. A till sale creates a demand event. Two hot fridge readings create one cold-chain breach, and it clears only after the temperature drops below the limit minus a hysteresis margin. Malformed input goes to `shelfsense/dead-letter`.
+2. **Bridge.** Checks each event (schema, topic and HMAC signature) and forwards it to SNS. A tampered or unsigned event goes to the dead-letter topic instead.
+3. **Inventory.** Records each event once by its unique `eventId`, so a redelivered message never changes stock twice. It updates the quantity and sales velocity and publishes `stock.updated`.
+4. **Replenishment.** Orders stock when days of cover fall below the supplier lead time plus one safety day. Orders under $150 are approved automatically. The manager approves the rest. A store keeps one open order per product until it is delivered.
+5. **Delivery.** Groups approved orders by supplier and region. The supplier plans a nearest-neighbour route with ETAs, the driver starts it, and each delivered stop restocks the shelf through a new stock event.
+6. **Cold chain.** Stores each alert and sends a notification.
 
-1. **Edge.** A shelf opening creates a `stock.delta` event. Later weight changes need two stable readings across the debounce interval. A POS sale creates a demand event. Two hot fridge readings create one `coldchain.alert` breach, and cooling below the hysteresis limit clears it. Bad input goes to `shelfsense/dead-letter`.
-2. **Inventory** records each event once through a unique `eventId`, then updates stock or sales velocity and publishes `stock.updated`. Only shelf, opening and delivery events change the physical quantity. POS sales only drive velocity, so a sale is never counted twice.
-3. **Replenishment** orders stock when days to stock out fall below the supplier lead time plus a safety day. Small orders are approved automatically. A manager approves the rest through the API. The API retries unsent approvals from an outbox.
-4. **Delivery** groups approved orders by supplier and region, plans a route, and emits a restock `stock.delta` for each delivered stop.
-5. **Cold chain** stores each alert and sends a notification.
+## Portal
+
+The portal is served by the API. It has a role switcher for manager, supplier and driver, and each role only sees its own actions as active:
+
+- **Manager:** approves orders.
+- **Supplier:** plans and dispatches delivery batches.
+- **Driver:** starts routes and confirms each stop.
+
+Every screen refreshes every five seconds. It only redraws a section when its data changes, so scroll position stays put.
+
+On AWS, `./aws/setup.sh portal` opens the portal already signed in as all three roles for one hour. The tokens sit after the `#` in the link, so the browser never sends them to the load balancer. The page moves them into session storage and clears them from the address bar. Locally, authentication is off, so the portal opens without a sign-in.
+
+## Security
+
+| Layer | Control |
+| --- | --- |
+| Devices | MQTT username and password; broker port closed to the internet |
+| Events | HMAC-SHA256 signature on every business event; bad events go to dead-letter |
+| API | Signed role tokens with expiry; checks on role and store scope (401 and 403) |
+| Network | Security groups: API only from the ALB, MongoDB only from core and workers, Node-RED bound to localhost |
+| Secrets | Generated at deploy time and kept in SSM Parameter Store as SecureString |
+| Data | SQS server-side encryption; SQS queue policies accept messages only from the ShelfSense topic |
+| Instances | IMDSv2 required; no secrets in the repository (`npm test` scans for them) |
+
+`./aws/setup.sh security` tries each attack in turn (missing or forged token, wrong role, wrong password, tampered event, direct port access) and prints the result.
 
 ## Code map
 
-| Folder or file | What it holds |
+| Path | What it holds |
 | --- | --- |
-| `src/*.js` | Processes you can run: `broker`, `service`, `api`, `bridge`, `workload` |
-| `src/services/` | The four microservices |
-| `src/shared/` | Config, event rules and signing, MongoDB store, MQTT and AWS transport, auth |
-| `node-red/` | Edge flow, edge logic and Node-RED launcher |
-| `public/` | Portal |
-| `aws/` | `setup.sh` deploys and runs the experiment step by step; `user-data.sh` sets up each EC2 machine |
-| `test/` | One test file per part of the code, plus `local-flow` for the whole loop. `memory-store.js` is the in memory store used by tests |
+| `src/api.js` | REST API, portal hosting and the approval outbox |
+| `src/broker.js` | MQTT broker with password check |
+| `src/bridge.js` | Edge to SNS bridge with event checks |
+| `src/service.js` | Runs one microservice, over MQTT locally or SQS on AWS |
+| `src/workload.js` | Demo simulator and paced load generator |
+| `src/services/` | Inventory, replenishment, cold chain and delivery |
+| `src/shared/` | Config, event rules and signing, MongoDB store, transport, auth |
+| `node-red/` | Edge flow, edge logic and the Node-RED launcher |
+| `public/` | Portal (plain HTML, CSS and JavaScript, no build step) |
+| `aws/` | `setup.sh` for deployment and experiments, `user-data.sh` for each EC2 role |
+| `test/` | 105 tests, one file per part of the code, plus a full local loop |
 
 ## Run locally
 
@@ -41,36 +99,47 @@ docker compose up --build -d
 docker compose --profile demo run --rm simulator
 ```
 
-The portal is at `http://localhost:3000` and Node-RED is at `http://localhost:1880`. Both bind to your computer only. The stack uses local MongoDB by default. Set `DOCKER_MONGODB_URI` in an ignored `.env` file to use Atlas. `docker compose down` stops the stack.
+The portal is at `http://localhost:3000` and Node-RED at `http://localhost:1880`. Both bind to your computer only. `docker compose down -v` stops the stack and clears its data. To use Atlas instead of local MongoDB, set `DOCKER_MONGODB_URI` in an ignored `.env` file.
 
-`npm test` also scans every project file for credentials. Run `npm audit --omit=dev --audit-level=high` for dependency advisories. To create a role token for the API, set `API_AUTH_SECRET` and run `npm run auth-token -- manager store-01`.
+GitHub Actions runs `npm test` and `npm audit` on every push.
 
-## AWS
+## Deploy on AWS Learner Lab
 
-The AWS deployment targets AWS Learner Lab (`us-east-1`). It needs the AWS CLI, Node.js and the lab key `labsuser.pem` (default path `~/Downloads/labsuser.pem`, override with `KEY_FILE`). Copy the AWS CLI block from AWS Details in the lab and run `pbpaste > aws/credentials`. Every local file the script uses stays in `aws/` and is ignored by git.
-
-```text
-EC2 edge: workload → MQTT broker → Node-RED → src/bridge.js
-  → SNS shelfsense-events, filtered by eventType
-  → SQS inventory, replenishment, coldchain, delivery (each with a dead letter queue)
-  → inventory on an Auto Scaling Group of EC2 workers; the other services and the API on EC2 core behind an ALB
-  → MongoDB on EC2 db, reachable only from core and the workers
-```
-
-Only inventory scales. SQS gives each message to one worker, so a new worker takes a share of the load. MQTT 3.1.1 has no shared subscriptions, so it cannot do that. MongoDB runs on EC2 because the Atlas free tier allows 100 operations per second, and each inventory event needs about five.
+You need the AWS CLI, Node.js and the lab key. Put the key at `aws/labsuser.pem` and run `chmod 400 aws/labsuser.pem`. Copy the AWS CLI block from AWS Details and run `pbpaste > aws/credentials`. Every local file the script writes stays in `aws/` and is ignored by git.
 
 ```bash
-./aws/setup.sh secrets     # random secrets in aws/.env.aws (ignored) and Parameter Store
+./aws/setup.sh secrets      # random secrets, stored in Parameter Store
 ./aws/setup.sh check
-./aws/setup.sh messaging
-./aws/setup.sh network
+./aws/setup.sh messaging    # SNS topic, SQS queues and dead-letter queues
+./aws/setup.sh network      # security groups
 ./aws/setup.sh db
-./aws/setup.sh core
-./aws/setup.sh edge
-./aws/setup.sh workers
+./aws/setup.sh core         # API, services and ALB
+./aws/setup.sh edge         # broker, Node-RED and bridge
+./aws/setup.sh workers      # inventory Auto Scaling Group and alarms
 ./aws/setup.sh demo
+./aws/setup.sh portal
 ```
 
-Scaling experiment: `./aws/setup.sh load calib 400 90` measures one worker. Then `scale 1` and `load baseline <rate> 600`, then `scale 4` and `load scaled <rate> 600` with the same rate. `./aws/setup.sh results <runId>` prints processed events, events per second and p50/p95 latency from MongoDB. `./aws/setup.sh teardown` deletes everything.
+Other commands:
 
-If the lab role cannot read Parameter Store, run the steps with `SECRETS_MODE=userdata`, which passes the secrets in the instance user data instead.
+| Command | What it does |
+| --- | --- |
+| `status` | Portal URL, instance IPs, worker count and queue depth |
+| `load <runId> <rate> <seconds>` | Sends paced load from the edge |
+| `results <runId>` | Processed events, throughput and p50/p95 latency from MongoDB |
+| `scale <n>` | Sets the worker count by hand |
+| `security` | Runs the security checks |
+| `logs <role> [container]` | Shows logs from an instance |
+| `update <role>` | Pulls the latest code on an instance and restarts it |
+| `tunnel` | Opens the Node-RED editor through SSH |
+| `teardown` | Deletes everything |
+
+To repeat the scaling experiment, run `load calib 400 90` with one worker, then `load scaled 400 90` with the alarms active, and compare `results calib` with `results scaled`.
+
+If the lab role cannot read Parameter Store, prefix the steps with `SECRETS_MODE=userdata` to pass the secrets in instance user data instead.
+
+## Known limits
+
+- The delivery map covers `store-01` to `store-04`. Load tests use up to 20 stores, so orders for other stores stay approved but are not routed.
+- Instances use basic CloudWatch monitoring, which averages over five minutes, so short CPU peaks look lower than they were.
+- MongoDB is a single instance. A production system would use a replica set or a managed service.
