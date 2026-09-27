@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ShelfSense on AWS Learner Lab. Run from anywhere: ./aws/setup.sh <step>
 # Steps in order: secrets, check, messaging, network, db, core, edge, workers, demo.
-# Experiment: scale, load, results. Other: status, token, tunnel, logs, teardown.
+# Experiment: scale, load, results. Other: status, token, tunnel, logs, update, teardown.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -409,6 +409,13 @@ cmd_logs() {
   else on "$role" "sudo docker logs --tail 60 $container"; fi
 }
 
+cmd_update() {
+  local role=${1:?usage: ./aws/setup.sh update <db|core|edge|worker>}
+  say "Updating $role: pull the latest commit from GitHub and restart its containers"
+  on "$role" 'sudo bash /var/lib/cloud/instance/user-data.txt && sudo tail -n 3 /var/log/shelfsense.log'
+  ok "$role updated"
+}
+
 cmd_teardown() {
   say "Deleting every ShelfSense resource"
   aws autoscaling delete-auto-scaling-group --auto-scaling-group-name "$P-inventory" --force-delete 2>/dev/null && ok "ASG deleting" || true
@@ -449,6 +456,6 @@ cmd_teardown() {
 step=${1:-help}
 shift || true
 case "$step" in
-  check|secrets|messaging|network|db|core|edge|workers|scale|demo|load|results|status|token|tunnel|logs|teardown) "cmd_$step" "$@" ;;
+  check|secrets|messaging|network|db|core|edge|workers|scale|demo|load|results|status|token|tunnel|logs|update|teardown) "cmd_$step" "$@" ;;
   *) sed -n '2,4p' "$0" | sed 's/^# //'; exit 1 ;;
 esac

@@ -36,7 +36,7 @@ services:
 
   node-red:
     image: nodered/node-red:4.0.9
-    command: node /data/start.js
+    entrypoint: ["node", "/data/start.js"]
     restart: unless-stopped
     depends_on:
       broker:

@@ -43,6 +43,7 @@ EOF
 umask 022
 
 if [ "$ROLE" = db ]; then
+  docker rm -f mongo >/dev/null 2>&1 || true
   docker run -d --name mongo --restart unless-stopped -p 27017:27017 -v mongo-data:/data/db \
     -e MONGO_INITDB_ROOT_USERNAME=shelfsense -e MONGO_INITDB_ROOT_PASSWORD="$MONGO_PASSWORD" mongo:7
   touch /opt/shelfsense/ready
@@ -51,7 +52,8 @@ if [ "$ROLE" = db ]; then
 fi
 
 APP=/opt/shelfsense/app
-[ -d "$APP" ] || git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$APP"
+# First boot clones the repo; running this script again (./aws/setup.sh update <role>) pulls the latest commit.
+if [ -d "$APP" ]; then git -C "$APP" pull --ff-only; else git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$APP"; fi
 docker build -t shelfsense "$APP"
 
 # Container logs go to CloudWatch Logs when the lab role allows it, otherwise they stay on the machine.
@@ -84,7 +86,7 @@ case "$ROLE" in
     run node-red --network shelfsense -p 127.0.0.1:1880:1880 -e MQTT_HOST=broker -e MQTT_PORT=1883 \
       -v "$APP/node-red/settings.js:/data/settings.js:ro" -v "$APP/node-red/start.js:/data/start.js:ro" \
       -v "$APP/node-red/flows.json:/data/flows.json:ro" -v "$APP/node-red/edge.js:/data/edge.js:ro" \
-      -v "$APP/src/shared:/src/shared:ro" nodered/node-red:4.0.9 node /data/start.js
+      -v "$APP/src/shared:/src/shared:ro" --entrypoint node nodered/node-red:4.0.9 /data/start.js
     run bridge --network shelfsense -e MQTT_URL=mqtt://broker:1883 shelfsense node src/bridge.js
     ;;
   *)

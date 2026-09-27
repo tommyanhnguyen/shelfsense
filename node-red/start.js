@@ -16,12 +16,24 @@ function prepareFlow(userDir, sourceFlow, username, password) {
   return path.join(userDir, 'flows.json');
 }
 
+// The nodered/node-red image installs Node-RED under its working directory, and its own
+// entrypoint would ignore this launcher. Run red.js directly so the credentials file is written first.
+function nodeRedCommand() {
+  if (process.env.NODE_RED_BIN) return { command: process.env.NODE_RED_BIN, prefix: [] };
+  try {
+    return { command: process.execPath, prefix: [require.resolve('node-red/red.js', { paths: [process.cwd()] })] };
+  } catch {
+    return { command: 'node-red', prefix: [] };
+  }
+}
+
 function main() {
   const userDir = fs.mkdtempSync(path.join(os.tmpdir(), 'shelfsense-red-'));
   const flow = prepareFlow(userDir, path.join(__dirname, 'flows.json'),
     process.env.MQTT_USERNAME, process.env.MQTT_PASSWORD);
-  const child = spawn(process.env.NODE_RED_BIN || 'node-red',
-    ['--settings', path.join(__dirname, 'settings.js'), '--userDir', userDir, flow],
+  const { command, prefix } = nodeRedCommand();
+  const child = spawn(command,
+    [...prefix, '--settings', path.join(__dirname, 'settings.js'), '--userDir', userDir, flow],
     { stdio: 'inherit', env: { ...process.env, NODE_RED_EPHEMERAL_CREDENTIALS: 'true' } });
   for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => child.kill(signal));
   const cleanup = () => fs.rmSync(userDir, { recursive: true, force: true });
@@ -31,4 +43,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { prepareFlow };
+module.exports = { nodeRedCommand, prepareFlow };
