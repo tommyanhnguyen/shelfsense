@@ -24,11 +24,12 @@ src/workload.js          simulated shelves, tills and fridges publish raw MQTT r
 
 | Folder or file | What it holds |
 | --- | --- |
-| `src/*.js` | Processes you can run: `broker`, `service`, `api`, `workload` |
+| `src/*.js` | Processes you can run: `broker`, `service`, `api`, `bridge`, `workload` |
 | `src/services/` | The four microservices |
 | `src/shared/` | Config, event rules and signing, MongoDB store, MQTT and AWS transport, auth |
 | `node-red/` | Edge flow, edge logic and Node-RED launcher |
 | `public/` | Portal |
+| `aws/` | `setup.sh` deploys and runs the experiment step by step; `user-data.sh` sets up each EC2 machine |
 | `test/` | One test file per part of the code, plus `local-flow` for the whole loop. `memory-store.js` is the in memory store used by tests |
 
 ## Run locally
@@ -46,4 +47,30 @@ The portal is at `http://localhost:3000` and Node-RED is at `http://localhost:18
 
 ## AWS
 
-The AWS deployment targets AWS Learner Lab. It uses EC2, SNS, SQS, an Application Load Balancer, an Auto Scaling Group for the inventory service, and CloudWatch. It is being built in `aws/`. Deployment and scaling still need live verification.
+The AWS deployment targets AWS Learner Lab (`us-east-1`). It needs the AWS CLI, Node.js, the lab credentials in `~/.aws/credentials` and the lab key at `~/.ssh/labsuser.pem`.
+
+```text
+EC2 edge: workload → MQTT broker → Node-RED → src/bridge.js
+  → SNS shelfsense-events, filtered by eventType
+  → SQS inventory, replenishment, coldchain, delivery (each with a dead letter queue)
+  → inventory on an Auto Scaling Group of EC2 workers; the other services and the API on EC2 core behind an ALB
+  → MongoDB on EC2 db, reachable only from core and the workers
+```
+
+Only inventory scales. SQS gives each message to one worker, so a new worker takes a share of the load. MQTT 3.1.1 has no shared subscriptions, so it cannot do that. MongoDB runs on EC2 because the Atlas free tier allows 100 operations per second, and each inventory event needs about five.
+
+```bash
+./aws/setup.sh secrets     # random secrets in aws/.env.aws (ignored) and Parameter Store
+./aws/setup.sh check
+./aws/setup.sh messaging
+./aws/setup.sh network
+./aws/setup.sh db
+./aws/setup.sh core
+./aws/setup.sh edge
+./aws/setup.sh workers
+./aws/setup.sh demo
+```
+
+Scaling experiment: `./aws/setup.sh load calib 400 90` measures one worker. Then `scale 1` and `load baseline <rate> 600`, then `scale 4` and `load scaled <rate> 600` with the same rate. `./aws/setup.sh results <runId>` prints processed events, events per second and p50/p95 latency from MongoDB. `./aws/setup.sh teardown` deletes everything.
+
+If the lab role cannot read Parameter Store, run the steps with `SECRETS_MODE=userdata`, which passes the secrets in the instance user data instead.

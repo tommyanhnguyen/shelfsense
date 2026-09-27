@@ -1,45 +1,38 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { createSimulation, runWorkload } = require('../src/workload');
+const { createEdgeProcessor } = require('../node-red/edge');
+const { createSimulation, runLoad } = require('../src/workload');
 
-test('cloud workload simulates every shelf with settled readings and repeatable bursts', async () => {
+function fakeClock() {
+  let t = 0;
+  return { now: () => t, sleep: async () => { t += 1000; } };
+}
+
+test('load run paces readings to the requested rate and duration', async () => {
+  const clock = fakeClock();
   const messages = [];
-  const result = await runWorkload({ stores: 2, shelvesPerStore: 3, bursts: 2,
-    publish: async (topic, payload) => messages.push({ topic, payload }) });
+  const result = await runLoad({ rate: 10, duration: 3, stores: 2, shelvesPerStore: 3, runId: 'calib',
+    ...clock, publish: async (topic, payload) => messages.push({ topic, payload }) });
 
-  assert.equal(result.published, 30);
-  assert.equal(messages.length, 30);
-  assert.equal(messages[0].topic, 'shelfsense/raw/store-01/shelf/shelf-001');
-  assert.equal(messages[0].payload.grams, 10000);
-  assert.equal(messages[1].payload.grams, 9000);
-  assert.equal(messages[2].payload.grams, 9000);
-  assert.equal(messages[2].payload.ts - messages[1].payload.ts, 900);
-  assert.equal(new Set(messages.map(row => row.payload.shelfId)).size, 3);
+  assert.ok(result.published >= 30 && result.published <= 31);
+  assert.equal(messages.length, result.published);
+  assert.equal(messages[0].topic, 'shelfsense/raw/store-01/shelf/shelf-001-rcalib');
+  assert.ok(messages.every(message => message.payload.runId === 'calib' && message.payload.wallTs > 0));
 });
 
-test('parallel shelves keep readings in order for each shelf', async () => {
-  const readings = new Map();
-  await runWorkload({ stores: 1, shelvesPerStore: 5, bursts: 2, concurrency: 5,
-    runId: 'trial1', publish: async (_topic, payload) => {
-      await new Promise(resolve => setTimeout(resolve, Math.random() * 2));
-      const values = readings.get(payload.shelfId) || [];
-      values.push(payload.grams);
-      readings.set(payload.shelfId, values);
-    } });
-  assert.equal(readings.size, 5);
-  for (const values of readings.values()) assert.deepEqual(values, [10000, 9000, 9000, 8000, 8000]);
+test('every load step settles into exactly one edge event, and an empty shelf is refilled', async () => {
+  const messages = [];
+  const result = await runLoad({ rate: 24, duration: 1, stores: 1, shelvesPerStore: 1, ...fakeClock(),
+    publish: async (topic, payload) => messages.push(payload) });
+  const edge = createEdgeProcessor({ debounceMs: 800 });
+  const events = messages.map(reading => edge.processShelf(reading)).filter(Boolean);
+
+  assert.equal(events.length, result.expectedStockEvents);
+  assert.deepEqual(events.map(event => event.data.delta), [10, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 10, -1]);
 });
 
-test('evidence workload can include a new cold chain breach and clear for each store', async () => {
-  const messages = [];
-  const result = await runWorkload({ stores: 2, shelvesPerStore: 1, bursts: 1,
-    runId: 'trial2', includeTemperature: true,
-    publish: async (topic, payload) => messages.push({ topic, payload }) });
-  const fridge = messages.filter(row => row.topic.includes('/fridge/'));
-  assert.equal(fridge.length, 6);
-  assert.equal(result.expectedColdchainAlerts, 4);
-  assert.deepEqual(fridge.slice(0, 3).map(row => row.payload.tempC), [6.1, 6.4, 4.1]);
-  assert.ok(fridge[0].payload.unitId.includes('trial2'));
+test('load run rejects an impossible rate', async () => {
+  await assert.rejects(runLoad({ rate: 0, duration: 1, publish: async () => {} }), /rate/);
 });
 
 test('simulator uses a real wall timestamp on every message', async () => {

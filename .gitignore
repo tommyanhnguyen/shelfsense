@@ -20,3 +20,5 @@ node-red/edge-state.json.tmp
 *.pem
 *.key
 .worktrees/
+aws/.env.aws
+aws/.state

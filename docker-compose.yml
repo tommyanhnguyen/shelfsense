@@ -154,10 +154,10 @@ services:
       STORES: 2
       STARTUP_DELAY_MS: 8000
 
-  cloud-workload:
+  load:
     build: .
     command: node src/workload.js
-    profiles: ["workload"]
+    profiles: ["load"]
     depends_on:
       node-red:
         condition: service_started
@@ -165,11 +165,10 @@ services:
       MQTT_URL: mqtt://broker:1883
       MQTT_USERNAME: ${MQTT_USERNAME:-}
       MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      RATE: ${RATE:-100}
+      DURATION: ${DURATION:-60}
       STORES: ${STORES:-20}
       SHELVES_PER_STORE: ${SHELVES_PER_STORE:-50}
-      BURSTS: ${BURSTS:-10}
-      WORKLOAD_CONCURRENCY: ${WORKLOAD_CONCURRENCY:-100}
-      INCLUDE_TEMPERATURE: ${INCLUDE_TEMPERATURE:-true}
       RUN_ID: ${RUN_ID:-}
 
 volumes:

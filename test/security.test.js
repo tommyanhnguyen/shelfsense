@@ -7,8 +7,9 @@ const path = require('node:path');
 const patterns = [
   ['AWS access key', /(?:AKIA|ASIA)[0-9A-Z]{16}/],
   ['private key', /-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----/],
-  ['MongoDB credential', /mongodb(?:\+srv)?:\/\/[^\s/@:]+:[^\s/@]+@/i],
-  ['assigned secret', /^\s*(?:API_AUTH_SECRET|EVENT_SIGNING_SECRET|MQTT_PASSWORD)\s*=\s*[^\s#"']{8,}/]
+  // A value that starts with $ is a shell variable reference, not a secret.
+  ['MongoDB credential', /mongodb(?:\+srv)?:\/\/[^\s/@:]+:[^\s/@$][^\s/@]*@/i],
+  ['assigned secret', /^\s*(?:API_AUTH_SECRET|EVENT_SIGNING_SECRET|MQTT_PASSWORD|MONGO_PASSWORD)\s*=\s*[^\s#"'$][^\s#"']{7,}/]
 ];
 
 function scanText(file, content) {
@@ -32,6 +33,7 @@ test('security scan reports credentials without repeating their values', () => {
 test('security scan accepts blank sample variables and detects embedded Mongo credentials', () => {
   assert.deepEqual(scanText('.env.example', 'MONGODB_URI=\nAPI_AUTH_SECRET=\n'), []);
   assert.equal(scanText('config.js', 'mongodb+srv://' + 'person:password@cluster.example/test').length, 1);
+  assert.deepEqual(scanText('user-data.sh', 'MQTT_PASSWORD=$MQTT_PASSWORD\nMONGODB_URI=mongodb://app:' + '$MONGO_PASSWORD@db:27017/x'), []);
 });
 
 test('project files contain no credentials', () => {

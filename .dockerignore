@@ -1,0 +1,12 @@
+node_modules
+.git
+.github
+test
+aws
+report_evidence
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+node-red/edge-state.json

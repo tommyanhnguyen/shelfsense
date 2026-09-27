@@ -23,8 +23,9 @@ const config = {
 
 function validateProductionConfig(env, role = 'worker') {
   const errors = [];
-  if (!/^mongodb\+srv:\/\//.test(env.MONGODB_URI || '')) {
-    errors.push('MONGODB_URI must use an Atlas mongodb+srv URI');
+  // The bridge only forwards events, so it never talks to the database.
+  if (role !== 'bridge' && !/^mongodb(\+srv)?:\/\/[^:@/]+:[^@/]+@/.test(env.MONGODB_URI || '')) {
+    errors.push('MONGODB_URI must include a database user and password');
   }
   if (!env.AWS_REGION) errors.push('AWS_REGION is required');
   if (env.EVENT_SIGNING_REQUIRED !== 'true') errors.push('EVENT_SIGNING_REQUIRED must be true');

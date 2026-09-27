@@ -57,7 +57,6 @@ async function runSimulator() {
 }
 
 // Load run for the scaling experiment
-
 function positiveInteger(value, name, maximum) {
   const number = Number(value);
   if (!Number.isSafeInteger(number) || number < 1 || number > maximum) {
@@ -66,86 +65,101 @@ function positiveInteger(value, name, maximum) {
   return number;
 }
 
-async function runWorkload(options) {
-  const stores = positiveInteger(options.stores, 'stores', 100);
-  const shelvesPerStore = positiveInteger(options.shelvesPerStore, 'shelvesPerStore', 1000);
-  const bursts = positiveInteger(options.bursts, 'bursts', 100);
-  const concurrency = positiveInteger(options.concurrency || 1, 'concurrency', 500);
-  if (bursts > 10) throw new Error('bursts must not empty the shelf below zero');
-  if (typeof options.publish !== 'function') throw new Error('publish is required');
-  const runId = options.runId || '';
-  if (runId && !/^[a-zA-Z0-9]+$/.test(runId)) throw new Error('runId must be alphanumeric');
-  const start = Date.now();
-  let published = 0;
+// Each shelf opens at 10 kg, then loses 1 kg per step until empty, then is refilled to 10 kg.
+// A step is two readings 900 ms apart on the sensor clock, so the edge debounce settles it into
+// exactly one stock.delta. The opening reading is the only one-message step.
+function createShelfCycle({ stores, shelvesPerStore, runId }) {
   const shelves = [];
   for (let storeNumber = 1; storeNumber <= stores; storeNumber += 1) {
     const store = 'store-' + String(storeNumber).padStart(2, '0');
     for (let shelfNumber = 1; shelfNumber <= shelvesPerStore; shelfNumber += 1) {
       const shelfId = 'shelf-' + String(shelfNumber).padStart(3, '0') + (runId ? '-r' + runId : '');
-      shelves.push({ store, shelfId });
+      shelves.push({ store, shelfId, grams: 10000, ts: 0, opened: false });
     }
   }
-  let nextShelf = 0;
-  async function worker() {
-    while (nextShelf < shelves.length) {
-      const { store, shelfId } = shelves[nextShelf++];
-      const topic = `shelfsense/raw/${store}/shelf/${shelfId}`;
-      const send = async (grams, ts) => {
-        await options.publish(topic, { store, shelfId, skuId: 'milk-1l', grams, ts,
-          wallTs: Date.now(), ...(runId ? { runId } : {}) });
-        published += 1;
-      };
-      await send(10000, 0);
-      for (let burst = 1; burst <= bursts; burst += 1) {
-        const grams = 10000 - burst * 1000;
-        await send(grams, burst * 1000 - 100);
-        await send(grams, burst * 1000 + 800);
-      }
+  let next = 0;
+  return function nextStep() {
+    const shelf = shelves.at(next);
+    next = (next + 1) % shelves.length;
+    const reading = (grams, ts) => ({
+      topic: `shelfsense/raw/${shelf.store}/shelf/${shelf.shelfId}`,
+      payload: { store: shelf.store, shelfId: shelf.shelfId, skuId: 'milk-1l', grams, ts, ...(runId ? { runId } : {}) }
+    });
+    if (!shelf.opened) {
+      shelf.opened = true;
+      return [reading(shelf.grams, 0)];
     }
-  }
-  await Promise.all(Array.from({ length: Math.min(concurrency, shelves.length) }, worker));
-  if (options.includeTemperature) {
-    for (let storeNumber = 1; storeNumber <= stores; storeNumber += 1) {
-      const store = 'store-' + String(storeNumber).padStart(2, '0');
-      const unitId = 'fridge-r' + (runId || 'sample');
-      const topic = `shelfsense/raw/${store}/fridge/${unitId}`;
-      for (const [index, tempC] of [6.1, 6.4, 4.1].entries()) {
-        await options.publish(topic, { store, unitId, tempC, ts: index,
-          wallTs: Date.now(), ...(runId ? { runId } : {}) });
-        published += 1;
-      }
-    }
-  }
-  return { runId, stores, shelvesPerStore, bursts, published,
-    expectedStockEvents: stores * shelvesPerStore * (1 + bursts),
-    expectedColdchainAlerts: options.includeTemperature ? stores * 2 : 0,
-    startedAt: new Date(start).toISOString(), finishedAt: new Date().toISOString() };
+    shelf.grams = shelf.grams >= 1000 ? shelf.grams - 1000 : 10000;
+    const settled = [reading(shelf.grams, shelf.ts + 1000), reading(shelf.grams, shelf.ts + 1900)];
+    shelf.ts += 2000;
+    return settled;
+  };
 }
 
-async function runLoad() {
+// Publishes `rate` raw readings per second for `duration` seconds, paced against the clock.
+async function runLoad(options) {
+  const rate = positiveInteger(options.rate, 'rate', 5000);
+  const duration = positiveInteger(options.duration, 'duration', 3600);
+  const stores = positiveInteger(options.stores ?? 20, 'stores', 100);
+  const shelvesPerStore = positiveInteger(options.shelvesPerStore ?? 50, 'shelvesPerStore', 1000);
+  const runId = options.runId || '';
+  if (runId && !/^[a-zA-Z0-9]{1,32}$/.test(runId)) throw new Error('runId must be alphanumeric');
+  if (typeof options.publish !== 'function') throw new Error('publish is required');
+  const now = options.now || Date.now;
+  const sleep = options.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const nextStep = createShelfCycle({ stores, shelvesPerStore, runId });
+  const total = rate * duration;
+  const start = now();
+  const startedAt = new Date().toISOString();
+  let published = 0;
+  let expectedStockEvents = 0;
+
+  while (published < total) {
+    const due = Math.min(total, Math.floor((now() - start) * rate / 1000));
+    const batch = [];
+    while (published + batch.length < due) {
+      batch.push(...nextStep());
+      expectedStockEvents += 1;
+    }
+    for (const message of batch) message.payload.wallTs = Date.now();
+    await Promise.all(batch.map(message => options.publish(message.topic, message.payload)));
+    published += batch.length;
+    if (options.onProgress) options.onProgress({ published, total });
+    if (published < total) await sleep(20);
+  }
+  return { runId, rate, duration, stores, shelvesPerStore, published, expectedStockEvents,
+    startedAt, finishedAt: new Date().toISOString() };
+}
+
+async function runLoadFromEnv() {
   const runId = process.env.RUN_ID || randomUUID().replaceAll('-', '').slice(0, 12);
   const client = await connectMqtt(config.mqttUrl, 'shelfsense-workload-' + process.pid);
+  let lastLog = 0;
   try {
-    const result = await runWorkload({
+    const result = await runLoad({
+      rate: process.env.RATE || 100,
+      duration: process.env.DURATION || 60,
       stores: process.env.STORES || 20,
       shelvesPerStore: process.env.SHELVES_PER_STORE || 50,
-      bursts: process.env.BURSTS || 10,
-      concurrency: process.env.WORKLOAD_CONCURRENCY || 100,
       runId,
-      includeTemperature: process.env.INCLUDE_TEMPERATURE !== 'false',
-      publish: (topic, payload) => publishJson(client, topic, payload)
+      publish: (topic, payload) => publishJson(client, topic, payload),
+      onProgress: ({ published, total }) => {
+        if (Date.now() - lastLog < 30000) return;
+        lastLog = Date.now();
+        console.log(JSON.stringify({ kind: 'load', runId, published, total, at: new Date().toISOString() }));
+      }
     });
-    console.log(JSON.stringify(result));
+    console.log(JSON.stringify({ kind: 'load_done', ...result }));
   } finally {
     await new Promise(resolve => client.end(false, resolve));
   }
 }
 
 if (require.main === module) {
-  (process.argv[2] === 'demo' ? runSimulator() : runLoad()).catch(error => {
+  (process.argv[2] === 'demo' ? runSimulator() : runLoadFromEnv()).catch(error => {
     console.error(error.message);
     process.exitCode = 1;
   });
 }
 
-module.exports = { createSimulation, runSimulator, runWorkload };
+module.exports = { createShelfCycle, createSimulation, runLoad, runSimulator };

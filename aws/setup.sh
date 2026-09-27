@@ -1,0 +1,454 @@
+#!/usr/bin/env bash
+# ShelfSense on AWS Learner Lab. Run from anywhere: ./aws/setup.sh <step>
+# Steps in order: secrets, check, messaging, network, db, core, edge, workers, demo.
+# Experiment: scale, load, results. Other: status, token, tunnel, logs, teardown.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+export AWS_REGION=${AWS_REGION:-us-east-1}
+export AWS_DEFAULT_REGION=$AWS_REGION
+export AWS_PAGER=""
+P=shelfsense
+KEY_NAME=${KEY_NAME:-vockey}
+KEY_FILE=${KEY_FILE:-$HOME/.ssh/labsuser.pem}
+REPO_URL=${REPO_URL:-https://github.com/tommyanhnguyen/shelfsense.git}
+REPO_REF=${REPO_REF:-main}
+PROFILE=${INSTANCE_PROFILE:-LabInstanceProfile}
+SECRETS_MODE=${SECRETS_MODE:-ssm}
+INSTANCE_TYPE=${INSTANCE_TYPE:-t3.small}
+SCALE_OUT_BACKLOG=${SCALE_OUT_BACKLOG:-300}
+SCALE_IN_BACKLOG=${SCALE_IN_BACKLOG:-20}
+STATE=aws/.state
+SECRETS=aws/.env.aws
+SECRET_NAMES="MONGO_PASSWORD MQTT_PASSWORD EVENT_SIGNING_SECRET API_AUTH_SECRET"
+QUEUES="inventory:stock.delta replenishment:stock.updated coldchain:coldchain.alert delivery:order.approved"
+
+touch "$STATE"
+say() { printf '\n== %s\n' "$*"; }
+ok() { printf '   OK   %s\n' "$*"; }
+fail() { printf '   FAIL %s\n' "$*" >&2; exit 1; }
+get() { { grep -E "^$1=" "$STATE" || true; } | tail -1 | cut -d= -f2-; }
+put() { { grep -v -E "^$1=" "$STATE" || true; } > "$STATE.tmp"; echo "$1=$2" >> "$STATE.tmp"; mv "$STATE.tmp" "$STATE"; }
+need() { local value; value=$(get "$1"); [ -n "$value" ] || fail "$1 is missing, run ./aws/setup.sh $2 first"; echo "$value"; }
+secret() { { grep -E "^$1=" "$SECRETS" || true; } | cut -d= -f2-; }
+SSH_OPTS=(-i "$KEY_FILE" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 -o LogLevel=ERROR)
+public_ip() {
+  aws ec2 describe-instances --filters "Name=tag:Name,Values=$P-$1" Name=instance-state-name,Values=running \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text
+}
+on() { local role=$1; shift; local ip; ip=$(public_ip "$role"); [ "$ip" != None ] || fail "no running $role instance"; ssh "${SSH_OPTS[@]}" "ec2-user@$ip" "$@"; }
+
+cmd_check() {
+  say "Checking your computer and the lab"
+  command -v aws >/dev/null || fail "AWS CLI is not installed"
+  ok "$(aws --version 2>&1 | cut -d' ' -f1)"
+  command -v node >/dev/null || fail "Node.js is not installed"
+  local arn
+  arn=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null) \
+    || fail "AWS credentials are missing or expired: paste them from AWS Details into ~/.aws/credentials"
+  ok "signed in as $arn"
+  [ -f "$KEY_FILE" ] || fail "key file $KEY_FILE not found"
+  [ "$(ls -l "$KEY_FILE" | cut -c1-10)" = "-r--------" ] || fail "run chmod 400 $KEY_FILE"
+  ok "key file $KEY_FILE"
+  aws ec2 describe-key-pairs --key-names "$KEY_NAME" >/dev/null 2>&1 || fail "key pair $KEY_NAME not found in $AWS_REGION"
+  ok "key pair $KEY_NAME"
+  [ "$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)" != None ] \
+    || fail "no default VPC in $AWS_REGION"
+  ok "default VPC"
+  [ -f "$SECRETS" ] || fail "run ./aws/setup.sh secrets first"
+  ok "secrets file $SECRETS"
+  if [ "$SECRETS_MODE" = ssm ]; then
+    aws ssm get-parameter --name "/$P/MQTT_PASSWORD" --with-decryption >/dev/null 2>&1 \
+      || fail "Parameter Store has no secrets: run ./aws/setup.sh secrets, or use SECRETS_MODE=userdata"
+    ok "secrets in Parameter Store"
+  fi
+  local remote
+  remote=$(git ls-remote "$REPO_URL" "refs/heads/$REPO_REF" | cut -f1)
+  if [ "$remote" = "$(git rev-parse HEAD)" ]; then ok "GitHub $REPO_REF matches your local commit"
+  else printf '   WARN EC2 clones %s from GitHub, which differs from your local HEAD. Push first.\n' "$REPO_REF"; fi
+}
+
+cmd_secrets() {
+  say "Secrets"
+  if [ ! -f "$SECRETS" ]; then
+    (umask 077; for name in $SECRET_NAMES; do echo "$name=$(openssl rand -hex 24)"; done; echo "ALERT_EMAIL=") > "$SECRETS"
+    ok "created $SECRETS with random values (ignored by git)"
+  else
+    ok "keeping existing $SECRETS"
+  fi
+  if [ "$SECRETS_MODE" = ssm ]; then
+    for name in $SECRET_NAMES; do
+      aws ssm put-parameter --name "/$P/$name" --type SecureString --value "$(secret "$name")" --overwrite >/dev/null
+      ok "stored /$P/$name in Parameter Store"
+    done
+  fi
+}
+
+cmd_messaging() {
+  say "SNS topics, SQS queues and log groups"
+  local events alerts
+  events=$(aws sns create-topic --name "$P-events" --query TopicArn --output text)
+  alerts=$(aws sns create-topic --name "$P-alerts" --query TopicArn --output text)
+  put SNS_EVENT_TOPIC_ARN "$events"
+  put SNS_ALERT_TOPIC_ARN "$alerts"
+  ok "topics $P-events and $P-alerts"
+  local pair name type dlq dlq_arn attrs url arn policy
+  for pair in $QUEUES; do
+    name=${pair%%:*}
+    type=${pair#*:}
+    dlq=$(aws sqs create-queue --queue-name "$P-$name-dlq" \
+      --attributes SqsManagedSseEnabled=true,MessageRetentionPeriod=1209600 --query QueueUrl --output text)
+    dlq_arn=$(aws sqs get-queue-attributes --queue-url "$dlq" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+    attrs=$(node -e 'console.log(JSON.stringify({SqsManagedSseEnabled: "true", VisibilityTimeout: "60",
+      RedrivePolicy: JSON.stringify({deadLetterTargetArn: process.argv[1], maxReceiveCount: "5"})}))' "$dlq_arn")
+    url=$(aws sqs create-queue --queue-name "$P-$name" --attributes "$attrs" --query QueueUrl --output text)
+    arn=$(aws sqs get-queue-attributes --queue-url "$url" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+    policy=$(node -e 'console.log(JSON.stringify({Policy: JSON.stringify({Version: "2012-10-17", Statement: [{
+      Effect: "Allow", Principal: {Service: "sns.amazonaws.com"}, Action: "sqs:SendMessage", Resource: process.argv[1],
+      Condition: {ArnEquals: {"aws:SourceArn": process.argv[2]}}}]})}))' "$arn" "$events")
+    aws sqs set-queue-attributes --queue-url "$url" --attributes "$policy"
+    aws sns subscribe --topic-arn "$events" --protocol sqs --notification-endpoint "$arn" --return-subscription-arn \
+      --attributes "$(node -e 'console.log(JSON.stringify({RawMessageDelivery: "true",
+        FilterPolicy: JSON.stringify({eventType: [process.argv[1]]})}))' "$type")" >/dev/null
+    put "SQS_$(echo "$name" | tr '[:lower:]' '[:upper:]')_QUEUE_URL" "$url"
+    ok "queue $P-$name with dead letter queue, receives $type"
+  done
+  local email
+  email=$(secret ALERT_EMAIL)
+  if [ -n "$email" ]; then
+    aws sns subscribe --topic-arn "$alerts" --protocol email --notification-endpoint "$email" >/dev/null
+    ok "alert email $email subscribed: confirm it from your inbox"
+  fi
+  local role
+  for role in edge core worker; do
+    aws logs create-log-group --log-group-name "/$P/$role" 2>/dev/null || true
+    aws logs put-retention-policy --log-group-name "/$P/$role" --retention-in-days 7 2>/dev/null || true
+  done
+  ok "log groups /$P/edge, /$P/core, /$P/worker"
+}
+
+security_group() {
+  local name=$1 vpc=$2 id
+  id=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=$P-$name" "Name=vpc-id,Values=$vpc" \
+    --query 'SecurityGroups[0].GroupId' --output text)
+  if [ "$id" = None ]; then
+    id=$(aws ec2 create-security-group --group-name "$P-$name" --description "ShelfSense $name" --vpc-id "$vpc" \
+      --query GroupId --output text)
+  fi
+  echo "$id"
+}
+
+allow() {
+  local sg=$1 port=$2 source=$3 out
+  if [[ $source == sg-* ]]; then
+    out=$(aws ec2 authorize-security-group-ingress --group-id "$sg" --protocol tcp --port "$port" --source-group "$source" 2>&1) || true
+  else
+    out=$(aws ec2 authorize-security-group-ingress --group-id "$sg" --protocol tcp --port "$port" --cidr "$source" 2>&1) || true
+  fi
+  case "$out" in *Duplicate*|*'"Return": true'*|'') ;; *) fail "$out" ;; esac
+}
+
+cmd_network() {
+  say "Network and security groups"
+  local vpc myip subnets alb edge core worker db
+  vpc=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+  subnets=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$vpc" Name=default-for-az,Values=true \
+    --query 'Subnets[].[AvailabilityZone,SubnetId]' --output text | sort | head -2 | cut -f2)
+  put VPC_ID "$vpc"
+  put SUBNET_A "$(echo "$subnets" | sed -n 1p)"
+  put SUBNET_B "$(echo "$subnets" | sed -n 2p)"
+  myip="$(curl -s https://checkip.amazonaws.com)/32"
+  alb=$(security_group alb "$vpc"); edge=$(security_group edge "$vpc"); core=$(security_group core "$vpc")
+  worker=$(security_group worker "$vpc"); db=$(security_group db "$vpc")
+  allow "$alb" 80 0.0.0.0/0
+  allow "$core" 3000 "$alb"
+  allow "$db" 27017 "$core"
+  allow "$db" 27017 "$worker"
+  for sg in "$edge" "$core" "$worker" "$db"; do allow "$sg" 22 "$myip"; done
+  put SG_ALB "$alb"; put SG_EDGE "$edge"; put SG_CORE "$core"; put SG_WORKER "$worker"; put SG_DB "$db"
+  ok "ALB open on port 80; API only from the ALB; MongoDB only from core and workers"
+  ok "SSH only from your IP $myip"
+}
+
+ami() {
+  aws ec2 describe-images --owners amazon --filters 'Name=name,Values=al2023-ami-2023.*-x86_64' Name=state,Values=available \
+    --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text
+}
+
+user_data() {
+  local role=$1 key value name
+  echo '#!/bin/bash'
+  echo "export ROLE=$role AWS_REGION=$AWS_REGION REPO_URL=$REPO_URL REPO_REF=$REPO_REF"
+  for key in DB_HOST SNS_EVENT_TOPIC_ARN SNS_ALERT_TOPIC_ARN SQS_INVENTORY_QUEUE_URL SQS_REPLENISHMENT_QUEUE_URL \
+    SQS_COLDCHAIN_QUEUE_URL SQS_DELIVERY_QUEUE_URL; do
+    value=$(get "$key")
+    [ -z "$value" ] || echo "export $key='$value'"
+  done
+  if [ "$SECRETS_MODE" = userdata ]; then
+    for name in $SECRET_NAMES; do echo "export $name='$(secret "$name")'"; done
+  fi
+  tail -n +2 aws/user-data.sh
+}
+
+launch() {
+  local role=$1 sg=$2 existing file id subnet image
+  subnet=$(need SUBNET_A network)
+  existing=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=$P-$role" \
+    Name=instance-state-name,Values=pending,running --query 'Reservations[0].Instances[0].InstanceId' --output text)
+  if [ "$existing" != None ]; then ok "$P-$role already running ($existing)"; echo "$existing" > /tmp/$P-$role.id; return; fi
+  file=$(mktemp)
+  user_data "$role" > "$file"
+  image=$(ami)
+  id=$(aws ec2 run-instances --image-id "$image" --instance-type "$INSTANCE_TYPE" --key-name "$KEY_NAME" \
+    --iam-instance-profile "Name=$PROFILE" --security-group-ids "$sg" --subnet-id "$subnet" \
+    --user-data "file://$file" --metadata-options HttpTokens=required,HttpPutResponseHopLimit=2 \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$P-$role},{Key=Project,Value=$P}]" \
+    --query 'Instances[0].InstanceId' --output text)
+  rm -f "$file"
+  aws ec2 wait instance-running --instance-ids "$id"
+  echo "$id" > /tmp/$P-$role.id
+  ok "$P-$role running ($id)"
+}
+
+wait_ready() {
+  local role=$1
+  printf '   ...  waiting for %s to finish its setup (a few minutes)' "$role"
+  for _ in $(seq 1 60); do
+    if on "$role" 'test -f /opt/shelfsense/ready' 2>/dev/null; then printf '\n'; ok "$role setup finished"; return; fi
+    printf '.'
+    sleep 10
+  done
+  printf '\n'
+  fail "$role did not finish. Read its log with ./aws/setup.sh logs $role"
+}
+
+cmd_db() {
+  say "Database machine"
+  local sg
+  sg=$(need SG_DB network)
+  launch db "$sg"
+  put DB_HOST "$(aws ec2 describe-instances --instance-ids "$(cat /tmp/$P-db.id)" \
+    --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)"
+  wait_ready db
+  ok "MongoDB with a password at $(get DB_HOST):27017, reachable only inside the VPC"
+}
+
+cmd_core() {
+  say "Core machine and load balancer"
+  need DB_HOST db >/dev/null
+  need SQS_REPLENISHMENT_QUEUE_URL messaging >/dev/null
+  local sg vpc subnet_a subnet_b sg_alb id tg alb dns
+  sg=$(need SG_CORE network); vpc=$(need VPC_ID network); sg_alb=$(need SG_ALB network)
+  subnet_a=$(need SUBNET_A network); subnet_b=$(need SUBNET_B network)
+  launch core "$sg"
+  id=$(cat /tmp/$P-core.id)
+  tg=$(aws elbv2 create-target-group --name "$P-api" --protocol HTTP --port 3000 --vpc-id "$vpc" \
+    --health-check-path /health --health-check-interval-seconds 15 --healthy-threshold-count 2 \
+    --query 'TargetGroups[0].TargetGroupArn' --output text)
+  aws elbv2 register-targets --target-group-arn "$tg" --targets "Id=$id"
+  alb=$(aws elbv2 create-load-balancer --name "$P-alb" --subnets "$subnet_a" "$subnet_b" \
+    --security-groups "$sg_alb" --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+  if [ "$(aws elbv2 describe-listeners --load-balancer-arn "$alb" --query 'length(Listeners)' --output text)" = 0 ]; then
+    aws elbv2 create-listener --load-balancer-arn "$alb" --protocol HTTP --port 80 \
+      --default-actions "Type=forward,TargetGroupArn=$tg" >/dev/null
+  fi
+  dns=$(aws elbv2 describe-load-balancers --load-balancer-arns "$alb" --query 'LoadBalancers[0].DNSName' --output text)
+  put TG_ARN "$tg"; put ALB_ARN "$alb"; put ALB_URL "http://$dns"
+  wait_ready core
+  printf '   ...  waiting for the ALB target to be healthy\n'
+  aws elbv2 wait target-in-service --target-group-arn "$tg" --targets "Id=$id"
+  ok "portal and API at http://$dns"
+}
+
+cmd_edge() {
+  say "Edge machine (broker, Node-RED, bridge)"
+  need SNS_EVENT_TOPIC_ARN messaging >/dev/null
+  local sg
+  sg=$(need SG_EDGE network)
+  launch edge "$sg"
+  wait_ready edge
+  ok "Node-RED editor: run ./aws/setup.sh tunnel, then open http://localhost:1880"
+}
+
+cmd_workers() {
+  say "Inventory workers: launch template and Auto Scaling Group"
+  local data high low queue sg subnet_a subnet_b image
+  sg=$(need SG_WORKER network); subnet_a=$(need SUBNET_A network); subnet_b=$(need SUBNET_B network)
+  need SNS_EVENT_TOPIC_ARN messaging >/dev/null; need DB_HOST db >/dev/null
+  image=$(ami)
+  data=$(AMI="$image" TYPE="$INSTANCE_TYPE" KEY="$KEY_NAME" PROFILE="$PROFILE" SG="$sg" \
+    USER_DATA="$(user_data worker | base64 | tr -d '\n')" node -e 'const e = process.env; console.log(JSON.stringify({
+    ImageId: e.AMI, InstanceType: e.TYPE, KeyName: e.KEY, IamInstanceProfile: {Name: e.PROFILE},
+    SecurityGroupIds: [e.SG], UserData: e.USER_DATA,
+    MetadataOptions: {HttpTokens: "required", HttpPutResponseHopLimit: 2},
+    TagSpecifications: [{ResourceType: "instance", Tags: [{Key: "Name", Value: "shelfsense-worker"}, {Key: "Project", Value: "shelfsense"}]}]}))')
+  if aws ec2 describe-launch-templates --launch-template-names "$P-worker" >/dev/null 2>&1; then
+    aws ec2 create-launch-template-version --launch-template-name "$P-worker" --launch-template-data "$data" >/dev/null
+    ok "launch template $P-worker updated"
+  else
+    aws ec2 create-launch-template --launch-template-name "$P-worker" --launch-template-data "$data" >/dev/null
+    ok "launch template $P-worker created"
+  fi
+  if [ "$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$P-inventory" \
+    --query 'length(AutoScalingGroups)' --output text)" = 0 ]; then
+    aws autoscaling create-auto-scaling-group --auto-scaling-group-name "$P-inventory" \
+      --launch-template "LaunchTemplateName=$P-worker,Version=\$Latest" --min-size 1 --max-size 1 --desired-capacity 1 \
+      --vpc-zone-identifier "$subnet_a,$subnet_b" --default-instance-warmup 60 \
+      --tags "Key=Project,Value=$P,PropagateAtLaunch=true"
+  fi
+  aws autoscaling enable-metrics-collection --auto-scaling-group-name "$P-inventory" --granularity 1Minute
+  ok "Auto Scaling Group $P-inventory: min 1, max 1 until you run ./aws/setup.sh scale"
+  high=$(aws autoscaling put-scaling-policy --auto-scaling-group-name "$P-inventory" --policy-name "$P-scale-out" \
+    --policy-type StepScaling --adjustment-type ChangeInCapacity --metric-aggregation-type Average \
+    --estimated-instance-warmup 120 --step-adjustments \
+    MetricIntervalLowerBound=0,MetricIntervalUpperBound=2000,ScalingAdjustment=1 \
+    MetricIntervalLowerBound=2000,ScalingAdjustment=2 --query PolicyARN --output text)
+  low=$(aws autoscaling put-scaling-policy --auto-scaling-group-name "$P-inventory" --policy-name "$P-scale-in" \
+    --policy-type StepScaling --adjustment-type ChangeInCapacity --metric-aggregation-type Average \
+    --step-adjustments MetricIntervalUpperBound=0,ScalingAdjustment=-1 --query PolicyARN --output text)
+  queue="$P-inventory"
+  aws cloudwatch put-metric-alarm --alarm-name "$P-backlog-high" --namespace AWS/SQS \
+    --metric-name ApproximateNumberOfMessagesVisible --dimensions "Name=QueueName,Value=$queue" --statistic Average \
+    --period 60 --evaluation-periods 1 --threshold "$SCALE_OUT_BACKLOG" --comparison-operator GreaterThanThreshold \
+    --alarm-actions "$high"
+  aws cloudwatch put-metric-alarm --alarm-name "$P-backlog-low" --namespace AWS/SQS \
+    --metric-name ApproximateNumberOfMessagesVisible --dimensions "Name=QueueName,Value=$queue" --statistic Average \
+    --period 60 --evaluation-periods 3 --threshold "$SCALE_IN_BACKLOG" --comparison-operator LessThanThreshold \
+    --alarm-actions "$low"
+  ok "scale out by 1 when the inventory backlog averages over $SCALE_OUT_BACKLOG for 1 minute (by 2 above +2000)"
+  ok "scale in by 1 when it stays under $SCALE_IN_BACKLOG for 3 minutes"
+}
+
+cmd_scale() {
+  local max=${1:?usage: ./aws/setup.sh scale <max workers>}
+  if [ "$max" = 1 ]; then
+    aws autoscaling update-auto-scaling-group --auto-scaling-group-name "$P-inventory" --min-size 1 --max-size 1 --desired-capacity 1
+  else
+    aws autoscaling update-auto-scaling-group --auto-scaling-group-name "$P-inventory" --min-size 1 --max-size "$max"
+  fi
+  ok "inventory workers: min 1, max $max"
+}
+
+cmd_demo() {
+  say "Small demo through AWS: 2 stores, shelves, POS and fridges"
+  on edge 'sudo docker run --rm --network shelfsense --env-file /opt/shelfsense/app.env -e MQTT_URL=mqtt://broker:1883 shelfsense node src/workload.js demo'
+  ok "open $(get ALB_URL) and use ./aws/setup.sh token manager '*' to sign in"
+}
+
+cmd_load() {
+  local run=${1:?usage: ./aws/setup.sh load <runId> <readings per second> <seconds>} rate=${2:?rate} duration=${3:?seconds}
+  say "Load run $run: $rate readings per second for $duration seconds (about $((rate / 2)) stock events per second)"
+  echo "   start (UTC): $(date -u +%H:%M:%S). Note it for the CloudWatch time range."
+  on edge "sudo docker rm -f load-$run >/dev/null 2>&1; sudo docker run -d --name load-$run --network shelfsense \
+    --env-file /opt/shelfsense/app.env -e MQTT_URL=mqtt://broker:1883 -e RUN_ID=$run -e RATE=$rate -e DURATION=$duration \
+    shelfsense node src/workload.js >/dev/null && sudo docker logs -f load-$run"
+  echo "   end (UTC): $(date -u +%H:%M:%S). Wait for the queue to drain, then run ./aws/setup.sh results $run"
+}
+
+cmd_results() {
+  local run=${1:?usage: ./aws/setup.sh results <runId>}
+  [[ $run =~ ^[A-Za-z0-9]+$ ]] || fail "runId must be letters and digits"
+  sed "s/__RUN_ID__/$run/" > /tmp/$P-results.js <<'JSEOF'
+const runId = '__RUN_ID__';
+const rows = db.stock_events.find({ status: 'APPLIED', 'event.data.runId': runId },
+  { 'event.data.wallTs': 1, appliedAt: 1 }).toArray();
+const latency = rows.map(r => r.appliedAt - r.event.data.wallTs).filter(Number.isFinite).sort((a, b) => a - b);
+const pick = p => latency.length ? latency[Math.min(latency.length - 1, Math.ceil(latency.length * p) - 1)] : null;
+const sent = rows.map(r => r.event.data.wallTs).sort((a, b) => a - b);
+const applied = rows.map(r => r.appliedAt).sort((a, b) => a - b);
+const seconds = rows.length ? (applied[applied.length - 1] - sent[0]) / 1000 : 0;
+const perMinute = {};
+for (const t of applied) { const m = new Date(t).toISOString().slice(11, 16); perMinute[m] = (perMinute[m] || 0) + 1; }
+printjson({
+  runId,
+  processed: rows.length,
+  stillProcessing: db.stock_events.countDocuments({ status: 'PROCESSING', 'event.data.runId': runId }),
+  firstSentUtc: rows.length ? new Date(sent[0]).toISOString() : null,
+  lastAppliedUtc: rows.length ? new Date(applied[applied.length - 1]).toISOString() : null,
+  seconds,
+  eventsPerSecond: seconds ? Number((rows.length / seconds).toFixed(1)) : null,
+  p50LatencyMs: pick(0.5),
+  p95LatencyMs: pick(0.95),
+  maxLatencyMs: latency.length ? latency[latency.length - 1] : null,
+  appliedPerMinuteUtc: perMinute
+});
+JSEOF
+  on db 'cat > /tmp/results.js' < /tmp/$P-results.js
+  on db 'sudo docker cp /tmp/results.js mongo:/tmp/results.js && sudo docker exec mongo sh -c "mongosh --quiet -u shelfsense -p \"\$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin shelfsense /tmp/results.js"'
+}
+
+cmd_status() {
+  say "Status"
+  echo "   portal: $(get ALB_URL)"
+  local role
+  for role in db core edge; do echo "   $role: $(public_ip "$role")"; done
+  aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$P-inventory" \
+    --query 'AutoScalingGroups[0].[MinSize,MaxSize,DesiredCapacity,length(Instances)]' --output text 2>/dev/null \
+    | awk '{print "   workers: min " $1 ", max " $2 ", desired " $3 ", running " $4}' || true
+  local url
+  url=$(get SQS_INVENTORY_QUEUE_URL)
+  [ -z "$url" ] || aws sqs get-queue-attributes --queue-url "$url" \
+    --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible \
+    --query 'Attributes.[ApproximateNumberOfMessages,ApproximateNumberOfMessagesNotVisible]' --output text \
+    | awk '{print "   inventory queue: " $1 " waiting, " $2 " in progress"}'
+}
+
+cmd_token() {
+  local role=${1:?usage: ./aws/setup.sh token <manager|supplier|driver> <stores or *>} stores=${2:-*}
+  API_AUTH_SECRET="$(secret API_AUTH_SECRET)" node src/shared/auth.js "$role" "$stores"
+}
+
+cmd_tunnel() {
+  say "Node-RED editor at http://localhost:1880 (Ctrl-C to close)"
+  ssh "${SSH_OPTS[@]}" -N -L 1880:localhost:1880 "ec2-user@$(public_ip edge)"
+}
+
+cmd_logs() {
+  local role=${1:?usage: ./aws/setup.sh logs <db|core|edge> [container]} container=${2:-}
+  if [ -z "$container" ]; then on "$role" 'sudo tail -n 60 /var/log/shelfsense.log; sudo docker ps --format "{{.Names}}: {{.Status}}"'
+  else on "$role" "sudo docker logs --tail 60 $container"; fi
+}
+
+cmd_teardown() {
+  say "Deleting every ShelfSense resource"
+  aws autoscaling delete-auto-scaling-group --auto-scaling-group-name "$P-inventory" --force-delete 2>/dev/null && ok "ASG deleting" || true
+  aws cloudwatch delete-alarms --alarm-names "$P-backlog-high" "$P-backlog-low" 2>/dev/null || true
+  local alb tg ids sub url name topic role sg
+  alb=$(get ALB_ARN); tg=$(get TG_ARN)
+  if [ -n "$alb" ]; then aws elbv2 delete-load-balancer --load-balancer-arn "$alb" 2>/dev/null || true
+    aws elbv2 wait load-balancers-deleted --load-balancer-arns "$alb" 2>/dev/null || true; ok "ALB deleted"; fi
+  [ -z "$tg" ] || aws elbv2 delete-target-group --target-group-arn "$tg" 2>/dev/null || true
+  ids=$(aws ec2 describe-instances --filters "Name=tag:Project,Values=$P" \
+    Name=instance-state-name,Values=pending,running,stopping,stopped --query 'Reservations[].Instances[].InstanceId' --output text)
+  if [ -n "$ids" ]; then aws ec2 terminate-instances --instance-ids $ids >/dev/null
+    aws ec2 wait instance-terminated --instance-ids $ids; ok "instances terminated"; fi
+  aws ec2 delete-launch-template --launch-template-name "$P-worker" >/dev/null 2>&1 || true
+  for name in db worker core edge alb; do
+    sg=$(get "SG_$(echo "$name" | tr '[:lower:]' '[:upper:]')")
+    [ -z "$sg" ] || for _ in 1 2 3 4 5 6; do aws ec2 delete-security-group --group-id "$sg" 2>/dev/null && break || sleep 10; done
+  done
+  ok "security groups deleted"
+  topic=$(get SNS_EVENT_TOPIC_ARN)
+  if [ -n "$topic" ]; then
+    for sub in $(aws sns list-subscriptions-by-topic --topic-arn "$topic" --query 'Subscriptions[].SubscriptionArn' --output text); do
+      aws sns unsubscribe --subscription-arn "$sub" 2>/dev/null || true
+    done
+  fi
+  for url in $(aws sqs list-queues --queue-name-prefix "$P-" --query 'QueueUrls[]' --output text 2>/dev/null); do
+    [ "$url" = None ] || aws sqs delete-queue --queue-url "$url"
+  done
+  ok "queues deleted"
+  for topic in "$(get SNS_EVENT_TOPIC_ARN)" "$(get SNS_ALERT_TOPIC_ARN)"; do [ -z "$topic" ] || aws sns delete-topic --topic-arn "$topic"; done
+  ok "topics deleted"
+  for name in $SECRET_NAMES; do aws ssm delete-parameter --name "/$P/$name" 2>/dev/null || true; done
+  for role in edge core worker; do aws logs delete-log-group --log-group-name "/$P/$role" 2>/dev/null || true; done
+  : > "$STATE"
+  ok "done. $SECRETS is kept; End Lab in the Learner Lab page as well."
+}
+
+step=${1:-help}
+shift || true
+case "$step" in
+  check|secrets|messaging|network|db|core|edge|workers|scale|demo|load|results|status|token|tunnel|logs|teardown) "cmd_$step" "$@" ;;
+  *) sed -n '2,4p' "$0" | sed 's/^# //'; exit 1 ;;
+esac
