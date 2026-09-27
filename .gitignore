@@ -22,3 +22,5 @@ node-red/edge-state.json.tmp
 .worktrees/
 aws/.env.aws
 aws/.state
+aws/credentials
+aws/.known_hosts

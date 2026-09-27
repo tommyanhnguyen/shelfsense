@@ -47,7 +47,7 @@ The portal is at `http://localhost:3000` and Node-RED is at `http://localhost:18
 
 ## AWS
 
-The AWS deployment targets AWS Learner Lab (`us-east-1`). It needs the AWS CLI, Node.js, the lab credentials in `~/.aws/credentials` and the lab key at `~/.ssh/labsuser.pem`.
+The AWS deployment targets AWS Learner Lab (`us-east-1`). It needs the AWS CLI, Node.js and the lab key `labsuser.pem` (default path `~/Downloads/labsuser.pem`, override with `KEY_FILE`). Copy the AWS CLI block from AWS Details in the lab and run `pbpaste > aws/credentials`. Every local file the script uses stays in `aws/` and is ignored by git.
 
 ```text
 EC2 edge: workload → MQTT broker → Node-RED → src/bridge.js

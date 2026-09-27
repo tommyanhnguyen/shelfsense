@@ -8,6 +8,9 @@ cd "$(dirname "$0")/.."
 export AWS_REGION=${AWS_REGION:-us-east-1}
 export AWS_DEFAULT_REGION=$AWS_REGION
 export AWS_PAGER=""
+# Every file this script keeps on your computer lives in aws/ and is ignored by git:
+# credentials (lab keys you paste), .env.aws (secrets), .state (resource ids), .known_hosts (SSH).
+if [ -f aws/credentials ]; then export AWS_SHARED_CREDENTIALS_FILE="$PWD/aws/credentials"; fi
 P=shelfsense
 KEY_NAME=${KEY_NAME:-vockey}
 KEY_FILE=${KEY_FILE:-$HOME/Downloads/labsuser.pem}
@@ -31,7 +34,7 @@ get() { { grep -E "^$1=" "$STATE" || true; } | tail -1 | cut -d= -f2-; }
 put() { { grep -v -E "^$1=" "$STATE" || true; } > "$STATE.tmp"; echo "$1=$2" >> "$STATE.tmp"; mv "$STATE.tmp" "$STATE"; }
 need() { local value; value=$(get "$1"); [ -n "$value" ] || fail "$1 is missing, run ./aws/setup.sh $2 first"; echo "$value"; }
 secret() { { grep -E "^$1=" "$SECRETS" || true; } | cut -d= -f2-; }
-SSH_OPTS=(-i "$KEY_FILE" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 -o LogLevel=ERROR)
+SSH_OPTS=(-i "$KEY_FILE" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=aws/.known_hosts -o ConnectTimeout=8 -o LogLevel=ERROR)
 public_ip() {
   aws ec2 describe-instances --filters "Name=tag:Name,Values=$P-$1" Name=instance-state-name,Values=running \
     --query 'Reservations[0].Instances[0].PublicIpAddress' --output text
@@ -45,7 +48,7 @@ cmd_check() {
   command -v node >/dev/null || fail "Node.js is not installed"
   local arn
   arn=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null) \
-    || fail "AWS credentials are missing or expired: paste them from AWS Details into ~/.aws/credentials"
+    || fail "AWS credentials are missing or expired: copy them from AWS Details, then run: pbpaste > aws/credentials"
   ok "signed in as $arn"
   [ -f "$KEY_FILE" ] || fail "key file $KEY_FILE not found"
   [ "$(ls -l "$KEY_FILE" | cut -c1-10)" = "-r--------" ] || fail "run chmod 400 $KEY_FILE"
@@ -191,22 +194,19 @@ user_data() {
 }
 
 launch() {
-  local role=$1 sg=$2 existing file id subnet image
+  local role=$1 sg=$2 existing id subnet image
   subnet=$(need SUBNET_A network)
   existing=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=$P-$role" \
     Name=instance-state-name,Values=pending,running --query 'Reservations[0].Instances[0].InstanceId' --output text)
-  if [ "$existing" != None ]; then ok "$P-$role already running ($existing)"; echo "$existing" > /tmp/$P-$role.id; return; fi
-  file=$(mktemp)
-  user_data "$role" > "$file"
+  if [ "$existing" != None ]; then ok "$P-$role already running ($existing)"; put "$(echo "$role" | tr "[:lower:]" "[:upper:]")_ID" "$existing"; return; fi
   image=$(ami)
   id=$(aws ec2 run-instances --image-id "$image" --instance-type "$INSTANCE_TYPE" --key-name "$KEY_NAME" \
     --iam-instance-profile "Name=$PROFILE" --security-group-ids "$sg" --subnet-id "$subnet" \
-    --user-data "file://$file" --metadata-options HttpTokens=required,HttpPutResponseHopLimit=2 \
+    --user-data "$(user_data "$role")" --metadata-options HttpTokens=required,HttpPutResponseHopLimit=2 \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$P-$role},{Key=Project,Value=$P}]" \
     --query 'Instances[0].InstanceId' --output text)
-  rm -f "$file"
   aws ec2 wait instance-running --instance-ids "$id"
-  echo "$id" > /tmp/$P-$role.id
+  put "$(echo "$role" | tr "[:lower:]" "[:upper:]")_ID" "$id"
   ok "$P-$role running ($id)"
 }
 
@@ -227,7 +227,7 @@ cmd_db() {
   local sg
   sg=$(need SG_DB network)
   launch db "$sg"
-  put DB_HOST "$(aws ec2 describe-instances --instance-ids "$(cat /tmp/$P-db.id)" \
+  put DB_HOST "$(aws ec2 describe-instances --instance-ids "$(get DB_ID)" \
     --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)"
   wait_ready db
   ok "MongoDB with a password at $(get DB_HOST):27017, reachable only inside the VPC"
@@ -241,7 +241,7 @@ cmd_core() {
   sg=$(need SG_CORE network); vpc=$(need VPC_ID network); sg_alb=$(need SG_ALB network)
   subnet_a=$(need SUBNET_A network); subnet_b=$(need SUBNET_B network)
   launch core "$sg"
-  id=$(cat /tmp/$P-core.id)
+  id=$(get CORE_ID)
   tg=$(aws elbv2 create-target-group --name "$P-api" --protocol HTTP --port 3000 --vpc-id "$vpc" \
     --health-check-path /health --health-check-interval-seconds 15 --healthy-threshold-count 2 \
     --query 'TargetGroups[0].TargetGroupArn' --output text)
@@ -348,7 +348,8 @@ cmd_load() {
 cmd_results() {
   local run=${1:?usage: ./aws/setup.sh results <runId>}
   [[ $run =~ ^[A-Za-z0-9]+$ ]] || fail "runId must be letters and digits"
-  sed "s/__RUN_ID__/$run/" > /tmp/$P-results.js <<'JSEOF'
+  # The query is written to /tmp on the db machine, not on your computer.
+  sed "s/__RUN_ID__/$run/" <<'JSEOF' | on db 'cat > /tmp/results.js'
 const runId = '__RUN_ID__';
 const rows = db.stock_events.find({ status: 'APPLIED', 'event.data.runId': runId },
   { 'event.data.wallTs': 1, appliedAt: 1 }).toArray();
@@ -373,7 +374,6 @@ printjson({
   appliedPerMinuteUtc: perMinute
 });
 JSEOF
-  on db 'cat > /tmp/results.js' < /tmp/$P-results.js
   on db 'sudo docker cp /tmp/results.js mongo:/tmp/results.js && sudo docker exec mongo sh -c "mongosh --quiet -u shelfsense -p \"\$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin shelfsense /tmp/results.js"'
 }
 
