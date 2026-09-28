@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ShelfSense on AWS Learner Lab. Run from anywhere: ./aws/setup.sh <step>
 # Steps in order: secrets, check, messaging, network, db, core, edge, workers, demo.
-# Experiment: scale, concurrency, scaler, load, results. Evidence: security. Other: status, portal, token, tunnel, logs, update, teardown.
+# Experiment: health, scale, concurrency, scaler, worker, load, results, dbstats. Evidence: security. Other: status, portal, token, tunnel, logs, update, teardown.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -275,10 +275,11 @@ worker_template() {
   # for example after ./aws/setup.sh concurrency, so workers launched later get the same settings.
   local sg=$1 data image
   image=$(ami)
-  data=$(AMI="$image" TYPE="$INSTANCE_TYPE" KEY="$KEY_NAME" PROFILE="$PROFILE" SG="$sg" \
+  data=$(AMI="$image" TYPE="$INSTANCE_TYPE" KEY="$KEY_NAME" PROFILE="$PROFILE" SG="$sg" CREDITS="$(get CPU_CREDITS)" \
     USER_DATA="$(user_data worker | base64 | tr -d '\n')" node -e 'const e = process.env; console.log(JSON.stringify({
     ImageId: e.AMI, InstanceType: e.TYPE, KeyName: e.KEY, IamInstanceProfile: {Name: e.PROFILE},
     SecurityGroupIds: [e.SG], UserData: e.USER_DATA,
+    ...(e.CREDITS ? {CreditSpecification: {CpuCredits: e.CREDITS}} : {}),
     MetadataOptions: {HttpTokens: "required", HttpPutResponseHopLimit: 2},
     TagSpecifications: [{ResourceType: "instance", Tags: [{Key: "Name", Value: "shelfsense-worker"}, {Key: "Project", Value: "shelfsense"}]}]}))')
   if aws ec2 describe-launch-templates --launch-template-names "$P-worker" >/dev/null 2>&1; then
@@ -580,6 +581,34 @@ printjson({ stockRows: rows.rows, avgAppliedIdsPerRow: Math.round(rows.avgIds ||
 JSEOF
   on db 'sudo docker cp /tmp/dbstats.js mongo:/tmp/dbstats.js && sudo docker exec mongo sh -c "mongosh --quiet -u shelfsense -p \"\$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin shelfsense /tmp/dbstats.js"'
 }
+cmd_health() {
+  # Run before each measured run. t3 instances in "standard" credit mode drop to 20% CPU once their
+  # credits run out, which would slow the edge or the database between runs and spoil a comparison.
+  local fix=${1:-} id name mode bal cpu from now low=0
+  say "Health: CPU credits and peak CPU in the last hour"
+  from=$(node -e 'console.log(new Date(Date.now() - 3600e3).toISOString())'); now=$(node -e 'console.log(new Date().toISOString())')
+  while read -r id name; do
+    [ -n "$id" ] || continue
+    mode=$(aws ec2 describe-instance-credit-specifications --instance-ids "$id" --query 'InstanceCreditSpecifications[0].CpuCredits' --output text)
+    bal=$(aws cloudwatch get-metric-statistics --namespace AWS/EC2 --metric-name CPUCreditBalance --dimensions "Name=InstanceId,Value=$id" \
+      --start-time "$from" --end-time "$now" --period 300 --statistics Average --query 'sort_by(Datapoints,&Timestamp)[-1].Average' --output text)
+    cpu=$(aws cloudwatch get-metric-statistics --namespace AWS/EC2 --metric-name CPUUtilization --dimensions "Name=InstanceId,Value=$id" \
+      --start-time "$from" --end-time "$now" --period 300 --statistics Maximum --query 'max(Datapoints[].Maximum)' --output text)
+    printf '   %-18s %-20s credits %-10s balance %-8s peak CPU %s%%\n' "$name" "$id" "$mode" "$bal" "$cpu"
+    if [ "$mode" = standard ]; then
+      if [ "$fix" = unlimited ]; then
+        aws ec2 modify-instance-credit-specification --instance-credit-specification "InstanceId=$id,CpuCredits=unlimited" >/dev/null \
+          && ok "$name switched to unlimited" && put CPU_CREDITS unlimited
+      else low=1; fi
+    fi
+  done < <(aws ec2 describe-instances --filters "Name=tag:Project,Values=$P" Name=instance-state-name,Values=running \
+    --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`]|[0].Value]' --output text)
+  [ "$fix" != unlimited ] || { worker_template "$(need SG_WORKER network)"; ok "new workers will start in unlimited mode"; }
+  [ "$low" = 0 ] || echo "   NOTE instances in standard mode can be throttled; run ./aws/setup.sh health unlimited"
+  say "Edge: is the bridge keeping up? (inFlight should be near 0 when no load is running)"
+  on edge 'sudo docker logs --tail 1 bridge 2>&1; sudo docker stats --no-stream --format "   {{.Name}}: CPU {{.CPUPerc}}, memory {{.MemUsage}}"'
+}
+
 cmd_status() {
   say "Status"
   echo "   portal: $(get ALB_URL)"
@@ -661,6 +690,6 @@ cmd_teardown() {
 step=${1:-help}
 shift || true
 case "$step" in
-  check|secrets|messaging|network|db|core|edge|workers|scale|demo|load|results|security|concurrency|scaler|worker|dbstats|status|portal|token|tunnel|logs|update|teardown) "cmd_$step" "$@" ;;
+  check|secrets|messaging|network|db|core|edge|workers|scale|demo|load|results|security|concurrency|scaler|worker|dbstats|health|status|portal|token|tunnel|logs|update|teardown) "cmd_$step" "$@" ;;
   *) sed -n '2,4p' "$0" | sed 's/^# //'; exit 1 ;;
 esac
