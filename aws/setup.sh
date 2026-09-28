@@ -370,6 +370,9 @@ const pick = p => latency.length ? latency[Math.min(latency.length - 1, Math.cei
 const sent = rows.map(r => r.event.data.wallTs).sort((a, b) => a - b);
 const applied = rows.map(r => r.appliedAt).sort((a, b) => a - b);
 const seconds = rows.length ? (applied[applied.length - 1] - sent[0]) / 1000 : 0;
+// Drain rate: from the first event applied to the last. With the workers paused during the load
+// (./aws/setup.sh worker pause), this is the true capacity of the workers, not the arrival rate.
+const drainSeconds = rows.length > 1 ? (applied[applied.length - 1] - applied[0]) / 1000 : 0;
 const perMinute = {};
 for (const t of applied) { const m = new Date(t).toISOString().slice(11, 16); perMinute[m] = (perMinute[m] || 0) + 1; }
 printjson({
@@ -380,6 +383,8 @@ printjson({
   lastAppliedUtc: rows.length ? new Date(applied[applied.length - 1]).toISOString() : null,
   seconds,
   eventsPerSecond: seconds ? Number((rows.length / seconds).toFixed(1)) : null,
+  drainSeconds,
+  drainEventsPerSecond: drainSeconds ? Number((rows.length / drainSeconds).toFixed(1)) : null,
   p50LatencyMs: pick(0.5),
   p95LatencyMs: pick(0.95),
   maxLatencyMs: latency.length ? latency[latency.length - 1] : null,
@@ -550,6 +555,16 @@ cmd_scaler() {
   ok "scaler $mode: source $source, policy $policy, max $max, starting worker rate $mu events/s (alarms paused)"
   ok "watch it with ./aws/setup.sh scaler log"
 }
+cmd_worker() {
+  # Pause the inventory workers while a load runs, so the queue fills up; resume them to measure how
+  # fast they drain it. That drain rate is the real capacity (HD experiment E1).
+  local action=${1:?usage: ./aws/setup.sh worker <pause|resume>} ip verb
+  case "$action" in pause) verb=stop ;; resume) verb=start ;; *) fail "use pause or resume" ;; esac
+  for ip in $(aws ec2 describe-instances --filters "Name=tag:Name,Values=$P-worker" Name=instance-state-name,Values=running \
+    --query 'Reservations[].Instances[].PublicIpAddress' --output text); do
+    ssh "${SSH_OPTS[@]}" "ec2-user@$ip" "sudo docker $verb inventory >/dev/null" && ok "worker $ip: inventory $action"
+  done
+}
 cmd_status() {
   say "Status"
   echo "   portal: $(get ALB_URL)"
@@ -631,6 +646,6 @@ cmd_teardown() {
 step=${1:-help}
 shift || true
 case "$step" in
-  check|secrets|messaging|network|db|core|edge|workers|scale|demo|load|results|security|concurrency|scaler|status|portal|token|tunnel|logs|update|teardown) "cmd_$step" "$@" ;;
+  check|secrets|messaging|network|db|core|edge|workers|scale|demo|load|results|security|concurrency|scaler|worker|status|portal|token|tunnel|logs|update|teardown) "cmd_$step" "$@" ;;
   *) sed -n '2,4p' "$0" | sed 's/^# //'; exit 1 ;;
 esac
