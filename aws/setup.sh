@@ -326,7 +326,13 @@ cmd_workers() {
 }
 
 cmd_scale() {
-  local max=${1:?usage: ./aws/setup.sh scale <max workers>}
+  local max=${1:?usage: ./aws/setup.sh scale <max workers> [fixed]}
+  if [ "${2:-}" = fixed ]; then
+    # Exactly N workers, nothing scales: used to measure throughput at a fixed size (HD E2).
+    aws autoscaling update-auto-scaling-group --auto-scaling-group-name "$P-inventory" --min-size "$max" --max-size "$max" --desired-capacity "$max"
+    ok "inventory workers fixed at $max; wait until ./aws/setup.sh status shows $max running"
+    return
+  fi
   if [ "$max" = 1 ]; then
     aws autoscaling update-auto-scaling-group --auto-scaling-group-name "$P-inventory" --min-size 1 --max-size 1 --desired-capacity 1
   else
