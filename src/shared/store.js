@@ -5,6 +5,17 @@ function isOpenOrder(order) {
   return Boolean(order) && OPEN_ORDER_STATUSES.includes(order.status);
 }
 
+// Each stock row keeps the ids of the events already applied to it, so a message that SQS
+// delivers again after a crash is not counted twice. The list used to grow with every event
+// (about 45 bytes each), and the 6.4HD tests showed the drain rate falling from 206 to 174
+// events/s once rows passed 130 KB. A redelivery arrives after the 60 s visibility timeout, and
+// the busiest test shelf takes about 10 events/s, so the last 600 ids cover that window.
+const APPLIED_ID_LIMIT = 600;
+
+function appliedIdsUpdate(eventIds, alreadyApplied, eventId) {
+  return { $cond: [alreadyApplied, eventIds, { $slice: [{ $concatArrays: [eventIds, [eventId]] }, -APPLIED_ID_LIMIT] }] };
+}
+
 function stockKey(store, skuId) {
   return store + '/' + skuId;
 }
@@ -164,7 +175,7 @@ class MongoStore {
             velocityPerDay: { $ifNull: ['$velocityPerDay', 0] },
             daysToStockout: { $ifNull: ['$daysToStockout', null] },
             updatedAt: { $cond: [alreadyApplied, { $ifNull: ['$updatedAt', null] }, event.ts] },
-            appliedEventIds: { $setUnion: [eventIds, [event.eventId]] }
+            appliedEventIds: appliedIdsUpdate(eventIds, alreadyApplied, event.eventId)
           }
         }
       ],
@@ -193,7 +204,7 @@ class MongoStore {
             velocityPerDay: { $ifNull: ['$velocityPerDay', 0] },
             daysToStockout: { $ifNull: ['$daysToStockout', null] },
             updatedAt: { $cond: [alreadyApplied, { $ifNull: ['$updatedAt', null] }, event.ts] },
-            appliedEventIds: { $setUnion: [eventIds, [event.eventId]] }
+            appliedEventIds: appliedIdsUpdate(eventIds, alreadyApplied, event.eventId)
           }
         }
       ],
@@ -385,6 +396,7 @@ class MongoStore {
 }
 
 module.exports = {
+  APPLIED_ID_LIMIT,
   MongoStore,
   OPEN_ORDER_INDEX,
   OPEN_ORDER_STATUSES,

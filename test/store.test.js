@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { MemoryStore } = require('./memory-store');
-const { MongoStore, newStockRow } = require('../src/shared/store');
+const { APPLIED_ID_LIMIT, MongoStore, newStockRow } = require('../src/shared/store');
 
 function stockEvent(overrides = {}) {
   return {
@@ -135,4 +135,45 @@ test('Mongo index migration tolerates another process removing the old index', a
 
   await store.ensureOpenOrderIndex();
   assert.equal(created, true);
+});
+
+// Evaluates the few aggregation operators the stock update uses, so the retry guard can be
+// checked without a database.
+function evaluate(expression, doc) {
+  if (typeof expression === 'string' && expression.startsWith('$')) return doc[expression.slice(1)];
+  if (Array.isArray(expression)) return expression.map(item => evaluate(item, doc));
+  if (!expression || typeof expression !== 'object') return expression;
+  const [op, args] = Object.entries(expression)[0];
+  const value = () => args.map(item => evaluate(item, doc));
+  if (op === '$ifNull') { const [a, b] = value(); return a ?? b; }
+  if (op === '$in') { const [item, list] = value(); return list.includes(item); }
+  if (op === '$cond') return evaluate(args[0], doc) ? evaluate(args[1], doc) : evaluate(args[2], doc);
+  if (op === '$concatArrays') return value().flat();
+  if (op === '$slice') { const [list, count] = value(); return list.slice(count); }
+  throw new Error('operator not covered: ' + op);
+}
+
+test('Mongo retry guard keeps only the most recent event ids on a stock row', async () => {
+  const store = new MongoStore('unused');
+  let doc = { appliedEventIds: Array.from({ length: APPLIED_ID_LIMIT + 400 }, (_, index) => 'old-' + index) };
+  store.db = {
+    collection: () => ({
+      updateOne: async (query, pipeline) => {
+        doc = { ...doc, appliedEventIds: evaluate(pipeline[0].$set.appliedEventIds, doc) };
+      },
+      findOne: async () => null
+    })
+  };
+
+  await store.applyPhysicalDelta(stockEvent({ eventId: 'new-1' }));
+  assert.equal(doc.appliedEventIds.length, APPLIED_ID_LIMIT);
+  assert.equal(doc.appliedEventIds.at(-1), 'new-1');
+
+  const before = doc.appliedEventIds;
+  await store.recordSale(stockEvent({ eventId: 'new-1', data: { skuId: 'milk-1l', delta: -1, source: 'pos' } }));
+  assert.deepEqual(doc.appliedEventIds, before, 'a redelivered event leaves the list unchanged');
+
+  await store.recordSale(stockEvent({ eventId: 'new-2', data: { skuId: 'milk-1l', delta: -1, source: 'pos' } }));
+  assert.deepEqual(doc.appliedEventIds.slice(-2), ['new-1', 'new-2']);
+  assert.equal(doc.appliedEventIds.length, APPLIED_ID_LIMIT);
 });
