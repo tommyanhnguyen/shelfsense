@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ShelfSense on AWS Learner Lab. Run from anywhere: ./aws/setup.sh <step>
 # Steps in order: secrets, check, messaging, network, db, core, edge, workers, demo.
-# Experiment: scale, load, results. Evidence: security. Other: status, portal, token, tunnel, logs, update, teardown.
+# Experiment: scale, concurrency, load, results. Evidence: security. Other: status, portal, token, tunnel, logs, update, teardown.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -183,7 +183,7 @@ user_data() {
   echo '#!/bin/bash'
   echo "export ROLE=$role AWS_REGION=$AWS_REGION REPO_URL=$REPO_URL REPO_REF=$REPO_REF"
   for key in DB_HOST SNS_EVENT_TOPIC_ARN SNS_ALERT_TOPIC_ARN SQS_INVENTORY_QUEUE_URL SQS_REPLENISHMENT_QUEUE_URL \
-    SQS_COLDCHAIN_QUEUE_URL SQS_DELIVERY_QUEUE_URL; do
+    SQS_COLDCHAIN_QUEUE_URL SQS_DELIVERY_QUEUE_URL QUEUE_CONCURRENCY; do
     value=$(get "$key")
     [ -z "$value" ] || echo "export $key='$value'"
   done
@@ -270,11 +270,10 @@ cmd_edge() {
   ok "Node-RED editor: run ./aws/setup.sh tunnel, then open http://localhost:1880"
 }
 
-cmd_workers() {
-  say "Inventory workers: launch template and Auto Scaling Group"
-  local data high low queue sg subnet_a subnet_b image
-  sg=$(need SG_WORKER network); subnet_a=$(need SUBNET_A network); subnet_b=$(need SUBNET_B network)
-  need SNS_EVENT_TOPIC_ARN messaging >/dev/null; need DB_HOST db >/dev/null
+worker_template() {
+  # Launch template for inventory workers. A new version is made whenever the user data changes,
+  # for example after ./aws/setup.sh concurrency, so workers launched later get the same settings.
+  local sg=$1 data image
   image=$(ami)
   data=$(AMI="$image" TYPE="$INSTANCE_TYPE" KEY="$KEY_NAME" PROFILE="$PROFILE" SG="$sg" \
     USER_DATA="$(user_data worker | base64 | tr -d '\n')" node -e 'const e = process.env; console.log(JSON.stringify({
@@ -289,6 +288,13 @@ cmd_workers() {
     aws ec2 create-launch-template --launch-template-name "$P-worker" --launch-template-data "$data" >/dev/null
     ok "launch template $P-worker created"
   fi
+}
+cmd_workers() {
+  say "Inventory workers: launch template and Auto Scaling Group"
+  local high low queue sg subnet_a subnet_b
+  sg=$(need SG_WORKER network); subnet_a=$(need SUBNET_A network); subnet_b=$(need SUBNET_B network)
+  need SNS_EVENT_TOPIC_ARN messaging >/dev/null; need DB_HOST db >/dev/null
+  worker_template "$sg"
   if [ "$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$P-inventory" \
     --query 'length(AutoScalingGroups)' --output text)" = 0 ]; then
     aws autoscaling create-auto-scaling-group --auto-scaling-group-name "$P-inventory" \
@@ -494,6 +500,18 @@ cmd_portal() {
   if command -v open >/dev/null 2>&1; then open "$link"; ok "opened $alb in your browser"
   else echo "   $link"; fi
 }
+cmd_concurrency() {
+  local n=${1:?usage: ./aws/setup.sh concurrency <messages each worker handles at once, 1 to 64>} ip
+  [[ $n =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le 64 ] || fail "concurrency must be a whole number from 1 to 64"
+  say "Inventory worker concurrency: $n"
+  put QUEUE_CONCURRENCY "$n"
+  worker_template "$(need SG_WORKER network)"
+  for ip in $(aws ec2 describe-instances --filters "Name=tag:Name,Values=$P-worker" Name=instance-state-name,Values=running \
+    --query 'Reservations[].Instances[].PublicIpAddress' --output text); do
+    ssh "${SSH_OPTS[@]}" "ec2-user@$ip" "sudo bash -c 'set -e; git -C /opt/shelfsense/app pull --ff-only -q; { grep \"^export \" /var/lib/cloud/instance/user-data.txt | grep -v QUEUE_CONCURRENCY; echo export QUEUE_CONCURRENCY=$n; tail -n +2 /opt/shelfsense/app/aws/user-data.sh; } > /opt/shelfsense/update.sh; bash /opt/shelfsense/update.sh'" \
+      && ok "worker $ip restarted with concurrency $n"
+  done
+}
 cmd_status() {
   say "Status"
   echo "   portal: $(get ALB_URL)"
@@ -575,6 +593,6 @@ cmd_teardown() {
 step=${1:-help}
 shift || true
 case "$step" in
-  check|secrets|messaging|network|db|core|edge|workers|scale|demo|load|results|security|status|portal|token|tunnel|logs|update|teardown) "cmd_$step" "$@" ;;
+  check|secrets|messaging|network|db|core|edge|workers|scale|demo|load|results|security|concurrency|status|portal|token|tunnel|logs|update|teardown) "cmd_$step" "$@" ;;
   *) sed -n '2,4p' "$0" | sed 's/^# //'; exit 1 ;;
 esac

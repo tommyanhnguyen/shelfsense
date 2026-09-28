@@ -78,7 +78,7 @@ case "$ROLE" in
     done
     ;;
   worker)
-    run inventory -e SERVICE_NAME=inventory shelfsense node src/service.js
+    run inventory -e SERVICE_NAME=inventory -e QUEUE_CONCURRENCY="${QUEUE_CONCURRENCY:-1}" shelfsense node src/service.js
     ;;
   edge)
     docker network create shelfsense >/dev/null 2>&1 || true

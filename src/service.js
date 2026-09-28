@@ -6,7 +6,7 @@ const { createInventoryService } = require('./services/inventory');
 const { createReplenishmentService } = require('./services/replenishment');
 const config = require('./shared/config');
 const { MongoStore } = require('./shared/store');
-const { connectMqtt, consumeBatch, eventTopic, handleMessage, publishEvent, publishJson, subscribe } = require('./shared/transport');
+const { connectMqtt, consumeBatch, createQueueConsumer, eventTopic, handleMessage, publishEvent, publishJson, subscribe } = require('./shared/transport');
 
 // One runner for every service. EVENT_TRANSPORT=mqtt runs locally, EVENT_TRANSPORT=aws reads SQS.
 const DEFINITIONS = {
@@ -108,33 +108,55 @@ async function startQueueService(name) {
   }
   const signingSecret = config.eventSigningRequired ? config.eventSigningSecret : undefined;
   if (config.eventSigningRequired && !signingSecret) throw new Error('Event signing secret is required');
+  const concurrency = queueConcurrency(process.env.QUEUE_CONCURRENCY);
   const region = process.env.AWS_REGION;
   const store = await MongoStore.connect(config.mongoUri);
   const sqs = new SQSClient({ region });
   const sns = new SNSClient({ region });
+  const service = createService(name, store,
+    event => publishEvent({ sns, topicArn, event, signingSecret }),
+    event => publishEvent({ sns, topicArn: alertTopicArn, event, signingSecret }));
+  const consumer = createQueueConsumer({
+    sqs,
+    queueUrl,
+    expectedType: definition.expectedType,
+    signingSecret,
+    concurrency,
+    handle: event => handleEvent(name, service, event),
+    onError: error => console.error(name + ' message failed: ' + error.message)
+  });
   let stopping = false;
   const stop = () => { stopping = true; };
   process.once('SIGTERM', stop);
   process.once('SIGINT', stop);
-  console.log(name + ' AWS queue service ready');
+  // One line every 10 s: this worker's real processing rate, used by the experiments and the scaler.
+  let reported = 0;
+  const statsTimer = setInterval(() => {
+    const done = consumer.stats.processed;
+    console.log(JSON.stringify({ kind: 'queue_stats', service: name, concurrency, processed: done - reported,
+      perSecond: Number(((done - reported) / 10).toFixed(1)), failed: consumer.stats.failed, held: consumer.held,
+      at: new Date().toISOString() }));
+    reported = done;
+  }, 10000);
+  statsTimer.unref();
+  console.log(name + ' AWS queue service ready, concurrency ' + concurrency);
   try {
-    while (!stopping) {
-      try {
-        const started = Date.now();
-        const result = await processQueueBatch({ name, store, sqs, sns, queueUrl, topicArn,
-          alertTopicArn, signingSecret });
-        if (result.received) console.log(JSON.stringify({ kind: 'queue_batch', service: name,
-          ...result, durationMs: Date.now() - started, at: new Date().toISOString() }));
-      } catch (error) {
-        console.error(name + ' queue poll failed: ' + error.message);
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-    }
+    await consumer.start(() => stopping);
   } finally {
+    clearInterval(statsTimer);
     sqs.destroy();
     sns.destroy();
     await store.close();
   }
+}
+
+function queueConcurrency(value) {
+  if (value === undefined || value === '') return 1;
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1 || number > 64) {
+    throw new Error('QUEUE_CONCURRENCY must be a whole number from 1 to 64');
+  }
+  return number;
 }
 
 function startService(name = process.env.SERVICE_NAME) {
@@ -148,4 +170,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { DEFINITIONS, processQueueBatch, serviceDefinition, startService };
+module.exports = { DEFINITIONS, processQueueBatch, queueConcurrency, serviceDefinition, startService };

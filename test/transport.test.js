@@ -6,7 +6,7 @@ const test = require('node:test');
 const mqtt = require('mqtt');
 const { startBroker } = require('../src/broker');
 const { createEvent, signEvent, verifyEvent } = require('../src/shared/events');
-const { buildMqttOptions, connectMqtt, consumeBatch, createPublisher, handleMessage, publishEvent, publishJson } = require('../src/shared/transport');
+const { buildMqttOptions, connectMqtt, consumeBatch, createKeyedLimiter, createPublisher, createQueueConsumer, handleMessage, publishEvent, publishJson } = require('../src/shared/transport');
 
 test('local broker accepts one MQTT message', { timeout: 5000 }, async t => {
   const broker = await startBroker(0);
@@ -240,4 +240,95 @@ test('AWS API publisher sends approval events to SNS', async () => {
 
   assert.equal(JSON.parse(sent.Message).eventId, event.eventId);
   assert.equal(sent.MessageAttributes.eventType.StringValue, 'order.approved');
+});
+
+test('keyed limiter runs different shelves in parallel up to the limit and one shelf at a time', async () => {
+  const limiter = createKeyedLimiter(3);
+  const running = new Set();
+  const orderByShelf = new Map();
+  let active = 0;
+  let peak = 0;
+  let sameShelfOverlap = false;
+  const jobs = [];
+  for (let index = 0; index < 24; index += 1) {
+    const shelf = 'shelf-' + (index % 4);
+    jobs.push(limiter.run(shelf, async () => {
+      if (running.has(shelf)) sameShelfOverlap = true;
+      running.add(shelf);
+      active += 1;
+      peak = Math.max(peak, active);
+      orderByShelf.set(shelf, [...(orderByShelf.get(shelf) || []), index]);
+      await new Promise(resolve => setTimeout(resolve, 2));
+      active -= 1;
+      running.delete(shelf);
+    }));
+  }
+  await Promise.all(jobs);
+
+  assert.equal(peak, 3);
+  assert.equal(sameShelfOverlap, false);
+  for (const order of orderByShelf.values()) assert.deepEqual(order, [...order].sort((a, b) => a - b));
+});
+
+test('queue consumer processes concurrently, deletes in batches and keeps failed messages', async () => {
+  const events = Array.from({ length: 12 }, (_, index) => createEvent('stock.delta', 'store-0' + (1 + (index % 3)), {
+    skuId: 'milk-1l', delta: -1, source: 'shelf'
+  }));
+  const pending = events.map((event, index) => ({ Body: JSON.stringify(event), ReceiptHandle: 'receipt-' + index }));
+  const deleted = [];
+  const commands = [];
+  const sqs = { send: async command => {
+    commands.push(command.constructor.name);
+    if (command.constructor.name === 'ReceiveMessageCommand') {
+      return { Messages: pending.splice(0, command.input.MaxNumberOfMessages) };
+    }
+    deleted.push(...command.input.Entries.map(entry => entry.ReceiptHandle));
+    return { Successful: command.input.Entries, Failed: [] };
+  } };
+  const errors = [];
+  let active = 0;
+  let peak = 0;
+  const consumer = createQueueConsumer({ sqs, queueUrl: 'https://example.invalid/queue', expectedType: 'stock.delta',
+    concurrency: 3, onError: error => errors.push(error.message),
+    handle: async event => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise(resolve => setTimeout(resolve, 2));
+      active -= 1;
+      if (event.eventId === events[5].eventId) throw new Error('MongoDB unavailable');
+    } });
+
+  while (pending.length) await consumer.poll();
+  await consumer.drain();
+
+  assert.equal(peak, 3);
+  assert.deepEqual(consumer.stats, { received: 12, processed: 11, failed: 1 });
+  assert.equal(deleted.length, 11);
+  assert.equal(deleted.includes('receipt-5'), false);
+  assert.equal(commands.filter(name => name === 'DeleteMessageBatchCommand').length, 2);
+  assert.deepEqual(errors, ['MongoDB unavailable']);
+});
+
+test('queue consumer with concurrency 1 handles one message at a time', async () => {
+  const events = Array.from({ length: 5 }, (_, index) => createEvent('stock.delta', 'store-0' + (1 + index), {
+    skuId: 'milk-1l', delta: -1, source: 'shelf'
+  }));
+  const pending = events.map((event, index) => ({ Body: JSON.stringify(event), ReceiptHandle: 'receipt-' + index }));
+  const sqs = { send: async command => command.constructor.name === 'ReceiveMessageCommand'
+    ? { Messages: pending.splice(0, command.input.MaxNumberOfMessages) } : { Failed: [] } };
+  let active = 0;
+  let peak = 0;
+  const consumer = createQueueConsumer({ sqs, queueUrl: 'https://example.invalid/queue', expectedType: 'stock.delta',
+    handle: async () => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise(resolve => setTimeout(resolve, 1));
+      active -= 1;
+    } });
+
+  while (pending.length) await consumer.poll();
+  await consumer.drain();
+
+  assert.equal(peak, 1);
+  assert.equal(consumer.stats.processed, 5);
 });

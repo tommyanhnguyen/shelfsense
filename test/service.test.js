@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const { MemoryStore } = require('./memory-store');
-const { processQueueBatch, serviceDefinition } = require('../src/service');
+const { processQueueBatch, queueConcurrency, serviceDefinition } = require('../src/service');
 const { validateProductionConfig } = require('../src/shared/config');
 const { createEvent } = require('../src/shared/events');
 
@@ -73,4 +73,10 @@ test('AWS inventory worker consumes stock delta, saves stock and emits stock upd
   assert.equal((await store.getStock('store-01', 'milk-1l')).qty, 10);
   assert.equal(published[0].type, 'stock.updated');
   assert.equal(deleted, 1);
+});
+
+test('queue concurrency defaults to one and rejects values outside 1 to 64', () => {
+  assert.equal(queueConcurrency(undefined), 1);
+  assert.equal(queueConcurrency('8'), 8);
+  for (const bad of ['0', '2.5', '65', 'many']) assert.throws(() => queueConcurrency(bad));
 });

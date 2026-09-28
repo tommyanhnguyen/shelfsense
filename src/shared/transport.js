@@ -1,6 +1,6 @@
 const fs = require('node:fs');
 const { PublishCommand, SNSClient } = require('@aws-sdk/client-sns');
-const { DeleteMessageCommand, ReceiveMessageCommand } = require('@aws-sdk/client-sqs');
+const { DeleteMessageBatchCommand, DeleteMessageCommand, ReceiveMessageCommand } = require('@aws-sdk/client-sqs');
 const { signEvent, validateEvent, verifyEvent } = require('./events');
 
 // MQTT
@@ -146,6 +146,171 @@ async function consumeBatch(options) {
   return { received: messages.length, processed, failed };
 }
 
+// Keyed concurrency. Messages for different keys run in parallel, up to `limit` at once.
+// Messages for the same key (one shelf: store + sku) run one at a time, because the inventory
+// update reads a stock row, computes velocity and writes it back.
+function createKeyedLimiter(limit) {
+  if (!Number.isInteger(limit) || limit < 1) throw new Error('Concurrency must be a positive integer');
+  const tails = new Map();
+  const waiting = [];
+  let active = 0;
+  const acquire = () => {
+    if (active < limit) {
+      active += 1;
+      return Promise.resolve();
+    }
+    return new Promise(resolve => waiting.push(resolve));
+  };
+  const release = () => {
+    const next = waiting.shift();
+    if (next) next();
+    else active -= 1;
+  };
+  function run(key, task) {
+    const previous = tails.get(key) || Promise.resolve();
+    const result = previous.then(async () => {
+      await acquire();
+      try {
+        return await task();
+      } finally {
+        release();
+      }
+    });
+    const tail = result.then(() => {}, () => {});
+    tails.set(key, tail);
+    tail.then(() => {
+      if (tails.get(key) === tail) tails.delete(key);
+    });
+    return result;
+  }
+  return { run, get active() { return active; } };
+}
+
+function messageKey(event) {
+  const data = event.data || {};
+  return event.store + '/' + (data.skuId ?? data.unitId ?? data.orderId ?? data.deliveryId ?? '');
+}
+
+// Long-running SQS consumer. It keeps up to `concurrency` messages in progress and prefetches a
+// little more, so a worker is never idle while it waits on MongoDB, SNS or SQS. Handled messages
+// are deleted in batches of ten. A failed message is not deleted: SQS retries it, then moves it
+// to the dead-letter queue. Duplicates from a retry are stopped by the unique eventId.
+function createQueueConsumer(options) {
+  const { sqs, queueUrl, expectedType, signingSecret, handle, onError = () => {} } = options;
+  if (!queueUrl) throw new Error('SQS queue URL is required');
+  const concurrency = options.concurrency ?? 1;
+  const limiter = createKeyedLimiter(concurrency);
+  const prefetch = Math.max(10, concurrency * 2);
+  const keyOf = options.keyOf || messageKey;
+  const stats = { received: 0, processed: 0, failed: 0 };
+  const deletes = [];
+  let held = 0;
+  let flushing = Promise.resolve();
+  let wake = null;
+
+  const signal = () => {
+    if (!wake) return;
+    const resume = wake;
+    wake = null;
+    resume();
+  };
+  const waitForSlot = () => new Promise(resolve => { wake = resolve; });
+
+  function flushOnce() {
+    const receipts = deletes.splice(0, 10);
+    if (!receipts.length) return flushing;
+    flushing = flushing
+      .then(() => sqs.send(new DeleteMessageBatchCommand({
+        QueueUrl: queueUrl,
+        Entries: receipts.map((receipt, index) => ({ Id: String(index), ReceiptHandle: receipt }))
+      })))
+      .then(result => {
+        for (const failure of result?.Failed || []) onError(new Error('Delete failed: ' + failure.Message));
+      })
+      .catch(error => onError(error));
+    return flushing;
+  }
+
+  async function flush() {
+    while (deletes.length) flushOnce();
+    await flushing;
+  }
+
+  async function processOne(message, event) {
+    try {
+      await handle(event);
+      deletes.push(message.ReceiptHandle);
+      if (deletes.length >= 10) flushOnce();
+      stats.processed += 1;
+    } catch (error) {
+      stats.failed += 1;
+      onError(error, message);
+    }
+  }
+
+  function accept(message) {
+    let event;
+    try {
+      event = parsePayload(message.Body);
+      validateEvent(event);
+      if (expectedType && event.type !== expectedType) throw new Error('Unexpected event type: ' + event.type);
+      if (signingSecret) verifyEvent(event, signingSecret);
+    } catch (error) {
+      stats.failed += 1;
+      onError(error, message);
+      return;
+    }
+    held += 1;
+    limiter.run(keyOf(event), () => processOne(message, event)).finally(() => {
+      held -= 1;
+      signal();
+    });
+  }
+
+  async function poll() {
+    const room = Math.min(10, prefetch - held);
+    if (room <= 0) {
+      await waitForSlot();
+      return 0;
+    }
+    const response = await sqs.send(new ReceiveMessageCommand({
+      QueueUrl: queueUrl,
+      MaxNumberOfMessages: room,
+      WaitTimeSeconds: options.waitTimeSeconds ?? 10,
+      VisibilityTimeout: options.visibilityTimeout ?? 60
+    }));
+    const messages = response.Messages || [];
+    stats.received += messages.length;
+    for (const message of messages) accept(message);
+    return messages.length;
+  }
+
+  async function drain() {
+    while (held > 0) await waitForSlot();
+    await flush();
+  }
+
+  async function start(isStopping) {
+    const timer = setInterval(flushOnce, 200);
+    timer.unref?.();
+    try {
+      while (!isStopping()) {
+        try {
+          await poll();
+        } catch (error) {
+          onError(error);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
+      await drain();
+    } finally {
+      clearInterval(timer);
+    }
+  }
+
+  return { poll, drain, flush, start, stats, concurrency, get held() { return held; } };
+}
+
 async function publishEvent({ sns, topicArn, event, signingSecret }) {
   if (!topicArn) throw new Error('SNS topic ARN is required');
   validateEvent(event);
@@ -192,4 +357,4 @@ async function openEventPublisher(clientId) {
   };
 }
 
-module.exports = { buildMqttOptions, connectMqtt, consumeBatch, createPublisher, eventTopic, handleMessage, openEventPublisher, parsePayload, publishEvent, publishJson, subscribe };
+module.exports = { buildMqttOptions, connectMqtt, consumeBatch, createKeyedLimiter, createPublisher, createQueueConsumer, eventTopic, handleMessage, messageKey, openEventPublisher, parsePayload, publishEvent, publishJson, subscribe };

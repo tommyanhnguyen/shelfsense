@@ -3,6 +3,7 @@ const test = require('node:test');
 const { MemoryStore } = require('./memory-store');
 const { createInventoryService } = require('../src/services/inventory');
 const { createEvent } = require('../src/shared/events');
+const { createKeyedLimiter, messageKey } = require('../src/shared/transport');
 
 function delta(eventId, source, amount, ts) {
   return createEvent('stock.delta', 'store-01', {
@@ -108,4 +109,32 @@ test('invalid business stock events are rejected before ledger or stock writes',
     assert.deepEqual(await store.listStock(), []);
     assert.deepEqual(published, []);
   }
+});
+
+test('keyed concurrency keeps every shelf correct when events interleave', async () => {
+  const store = new MemoryStore();
+  let call = 0;
+  // Every store call waits 0 to 2 ms, so events for different shelves interleave.
+  const slowStore = new Proxy(store, { get(target, property) {
+    const value = target[property];
+    if (typeof value !== 'function') return value;
+    return async (...args) => {
+      await new Promise(resolve => setTimeout(resolve, call++ % 3));
+      return value.apply(target, args);
+    };
+  } });
+  const service = createInventoryService({ store: slowStore, publish: async () => {} });
+  const limiter = createKeyedLimiter(8);
+  const shops = ['store-01', 'store-02', 'store-03'];
+  const events = shops.map(shop => createEvent('stock.delta', shop, { skuId: 'milk-1l', delta: 50, source: 'opening' },
+    { eventId: shop + '-open', ts: 0 }));
+  for (let index = 0; index < 30; index += 1) {
+    const shop = shops[index % 3];
+    events.push(createEvent('stock.delta', shop, { skuId: 'milk-1l', delta: -1, source: 'shelf' },
+      { eventId: shop + '-' + index, ts: index + 1 }));
+  }
+
+  await Promise.all(events.map(event => limiter.run(messageKey(event), () => service.handle(event))));
+
+  for (const shop of shops) assert.equal((await store.getStock(shop, 'milk-1l')).qty, 40);
 });
