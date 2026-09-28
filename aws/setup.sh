@@ -565,6 +565,21 @@ cmd_worker() {
     ssh "${SSH_OPTS[@]}" "ec2-user@$ip" "sudo docker $verb inventory >/dev/null" && ok "worker $ip: inventory $action"
   done
 }
+cmd_dbstats() {
+  # Size of the stock rows. Each row keeps the ids of the events already applied to it (the retry
+  # guard), so rows grow with every run; this shows by how much.
+  cat <<'JSEOF' | on db 'cat > /tmp/dbstats.js'
+const rows = db.stock_levels.aggregate([
+  { $project: { ids: { $size: { $ifNull: ['$appliedEventIds', []] } }, bytes: { $bsonSize: '$$ROOT' } } },
+  { $group: { _id: null, rows: { $sum: 1 }, avgIds: { $avg: '$ids' }, maxIds: { $max: '$ids' },
+      avgKB: { $avg: { $divide: ['$bytes', 1024] } }, maxKB: { $max: { $divide: ['$bytes', 1024] } } } }
+]).toArray()[0] || {};
+printjson({ stockRows: rows.rows, avgAppliedIdsPerRow: Math.round(rows.avgIds || 0), maxAppliedIdsPerRow: rows.maxIds,
+  avgRowKB: Number((rows.avgKB || 0).toFixed(1)), maxRowKB: Number((rows.maxKB || 0).toFixed(1)),
+  stockEvents: db.stock_events.countDocuments({}) });
+JSEOF
+  on db 'sudo docker cp /tmp/dbstats.js mongo:/tmp/dbstats.js && sudo docker exec mongo sh -c "mongosh --quiet -u shelfsense -p \"\$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin shelfsense /tmp/dbstats.js"'
+}
 cmd_status() {
   say "Status"
   echo "   portal: $(get ALB_URL)"
@@ -646,6 +661,6 @@ cmd_teardown() {
 step=${1:-help}
 shift || true
 case "$step" in
-  check|secrets|messaging|network|db|core|edge|workers|scale|demo|load|results|security|concurrency|scaler|worker|status|portal|token|tunnel|logs|update|teardown) "cmd_$step" "$@" ;;
+  check|secrets|messaging|network|db|core|edge|workers|scale|demo|load|results|security|concurrency|scaler|worker|dbstats|status|portal|token|tunnel|logs|update|teardown) "cmd_$step" "$@" ;;
   *) sed -n '2,4p' "$0" | sed 's/^# //'; exit 1 ;;
 esac
