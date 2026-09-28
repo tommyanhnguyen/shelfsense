@@ -27,8 +27,20 @@ class MemoryStore {
   async completeStockEvent(eventId) {
     const record = this.stockEvents.get(eventId);
     if (!record) throw new Error('Unknown stock event: ' + eventId);
-    if (record.event) record.status = 'APPLIED';
+    if (record.event) {
+      record.status = 'APPLIED';
+      record.appliedAt = Date.now();
+    }
     return true;
+  }
+
+  async countAppliedSince(since) {
+    return [...this.stockEvents.values()].filter(record => record.appliedAt >= since).length;
+  }
+
+  async saveScalerDecision(row) {
+    this.scalerLog = [...(this.scalerLog || []), structuredClone(row)];
+    return row;
   }
 
   async applyPhysicalDelta(event) {

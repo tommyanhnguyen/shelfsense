@@ -45,6 +45,7 @@ class MongoStore {
     await Promise.all([
       this.db.collection('stock_events').createIndex({ eventId: 1 }, { unique: true }),
       this.db.collection('stock_events').createIndex({ 'event.data.runId': 1, status: 1 }),
+      this.db.collection('stock_events').createIndex({ appliedAt: 1 }, { sparse: true }),
       this.db.collection('stock_levels').createIndex({ store: 1, skuId: 1 }, { unique: true }),
       this.db.collection('orders').createIndex({ orderId: 1 }, { unique: true }),
       this.db.collection('coldchain').createIndex({ eventId: 1 }, { unique: true }),
@@ -132,6 +133,16 @@ class MongoStore {
       { eventId }, { $set: { status: 'APPLIED', appliedAt: Date.now() } }
     );
     return true;
+  }
+
+  // Used by the autoscaler to measure how fast the workers really apply events.
+  async countAppliedSince(since) {
+    return this.db.collection('stock_events').countDocuments({ appliedAt: { $gte: since } });
+  }
+
+  async saveScalerDecision(row) {
+    await this.db.collection('scaler_log').insertOne({ ...row });
+    return row;
   }
 
   async applyPhysicalDelta(event) {

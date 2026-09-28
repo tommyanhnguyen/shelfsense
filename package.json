@@ -24,6 +24,8 @@
   "author": "Tommy Nguyen 224345482",
   "license": "ISC",
   "dependencies": {
+    "@aws-sdk/client-auto-scaling": "3.1141.0",
+    "@aws-sdk/client-cloudwatch": "3.1141.0",
     "@aws-sdk/client-sns": "3.1141.0",
     "@aws-sdk/client-sqs": "3.1141.0",
     "aedes": "^1.1.2",

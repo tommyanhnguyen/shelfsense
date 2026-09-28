@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ShelfSense on AWS Learner Lab. Run from anywhere: ./aws/setup.sh <step>
 # Steps in order: secrets, check, messaging, network, db, core, edge, workers, demo.
-# Experiment: scale, concurrency, load, results. Evidence: security. Other: status, portal, token, tunnel, logs, update, teardown.
+# Experiment: scale, concurrency, scaler, load, results. Evidence: security. Other: status, portal, token, tunnel, logs, update, teardown.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -512,6 +512,38 @@ cmd_concurrency() {
       && ok "worker $ip restarted with concurrency $n"
   done
 }
+cmd_scaler() {
+  # HD experiment: the model-based scaler on core replaces the CloudWatch alarms while it runs.
+  # A = fast detection (read SQS every 10 s) with the old step rule; B = the rate model on the
+  # one-minute CloudWatch metrics; AB = both. The worker rate mu comes from ./aws/setup.sh concurrency runs.
+  local mode=${1:?usage: ./aws/setup.sh scaler <A|B|AB|dryrun|off|check|log> [max workers] [worker events/s]}
+  local max=${2:-6} mu=${3:-40} source policy dry=false group="$P-inventory" queue
+  queue=$(need SQS_INVENTORY_QUEUE_URL messaging)
+  case "$mode" in
+    off)
+      on core 'sudo docker rm -f scaler >/dev/null 2>&1 || true'
+      aws cloudwatch enable-alarm-actions --alarm-names "$P-backlog-high" "$P-backlog-low"
+      ok "scaler stopped; the CloudWatch alarms are in charge again"; return ;;
+    log)
+      on core 'sudo docker logs scaler 2>&1 | grep "\"kind\":\"scaler\""'; return ;;
+    check)
+      say "Can the core machine's role (LabRole) do what the scaler needs?"
+      on core "set -e; d=\$(aws autoscaling describe-auto-scaling-groups --region $AWS_REGION --auto-scaling-group-names $group --query 'AutoScalingGroups[0].DesiredCapacity' --output text); echo '   OK   describe group, desired '\$d; aws autoscaling set-desired-capacity --region $AWS_REGION --auto-scaling-group-name $group --desired-capacity \$d && echo '   OK   set desired capacity'; aws sqs get-queue-attributes --region $AWS_REGION --queue-url $queue --attribute-names ApproximateNumberOfMessages >/dev/null && echo '   OK   read the queue'; aws cloudwatch get-metric-statistics --region $AWS_REGION --namespace AWS/SQS --metric-name ApproximateNumberOfMessagesVisible --dimensions Name=QueueName,Value=$P-inventory --start-time \$(date -u -d '-5 min' +%FT%TZ) --end-time \$(date -u +%FT%TZ) --period 60 --statistics Average >/dev/null && echo '   OK   read CloudWatch metrics'"
+      return ;;
+    A) source=sqs; policy=step ;;
+    B) source=cloudwatch; policy=model ;;
+    AB) source=sqs; policy=model ;;
+    dryrun) source=sqs; policy=model; dry=true ;;
+    *) fail "mode must be A, B, AB, dryrun, off, check or log" ;;
+  esac
+  aws cloudwatch disable-alarm-actions --alarm-names "$P-backlog-high" "$P-backlog-low"
+  aws autoscaling update-auto-scaling-group --auto-scaling-group-name "$group" --min-size 1 --max-size "$max"
+  on core "sudo docker rm -f scaler >/dev/null 2>&1; sudo docker run -d --name scaler --restart unless-stopped \
+    --env-file /opt/shelfsense/app.env -e SCALER_SOURCE=$source -e SCALER_POLICY=$policy -e SCALER_MAX=$max \
+    -e SCALER_MU=$mu -e SCALER_DRY_RUN=$dry -e SCALER_GROUP=$group shelfsense node src/scaler.js >/dev/null"
+  ok "scaler $mode: source $source, policy $policy, max $max, starting worker rate $mu events/s (alarms paused)"
+  ok "watch it with ./aws/setup.sh scaler log"
+}
 cmd_status() {
   say "Status"
   echo "   portal: $(get ALB_URL)"
@@ -593,6 +625,6 @@ cmd_teardown() {
 step=${1:-help}
 shift || true
 case "$step" in
-  check|secrets|messaging|network|db|core|edge|workers|scale|demo|load|results|security|concurrency|status|portal|token|tunnel|logs|update|teardown) "cmd_$step" "$@" ;;
+  check|secrets|messaging|network|db|core|edge|workers|scale|demo|load|results|security|concurrency|scaler|status|portal|token|tunnel|logs|update|teardown) "cmd_$step" "$@" ;;
   *) sed -n '2,4p' "$0" | sed 's/^# //'; exit 1 ;;
 esac
