@@ -4,7 +4,7 @@ const { GetQueueAttributesCommand, SQSClient } = require('@aws-sdk/client-sqs');
 const config = require('./shared/config');
 const { MongoStore } = require('./shared/store');
 
-// Autoscaler for the inventory workers. It replaces the CloudWatch alarm policy of the 6.3D build.
+// Autoscaler for the inventory workers. It replaces the CloudWatch alarm policy of v1.0.
 //
 // Two switches let each part be measured on its own (the HD ablation):
 //   SCALER_SOURCE  sqs         read the queue directly every 10 s (fast detection)
@@ -109,7 +109,7 @@ function decideModel(settings, state, observation) {
       state: { ...next, lowTicks: 0, lastChangeAt: observation.at, lastScaleOutAt: observation.at } };
   }
   // Scale out fast, scale in slowly. A new worker needs about three minutes to start, and the
-  // 6.4HD E3 runs showed that scaling in sooner removed workers before they had done any work, then
+  // ablation runs showed that scaling in sooner removed workers before they had done any work, then
   // added them again on the next burst.
   const sinceScaleOut = observation.at - (state.lastScaleOutAt ?? -Infinity);
   if (target < current && sinceScaleOut < settings.scaleInCooldownSeconds * 1000) {
@@ -131,7 +131,7 @@ function decideModel(settings, state, observation) {
   return { ...facts, target: current, reason: 'hold' + capped, state: { ...next, lowTicks: 0 } };
 }
 
-// The 6.3D rule, driven by the same observations, so that only the policy changes.
+// The v1.0 alarm rule, driven by the same observations, so that only the policy changes.
 function decideStep(settings, state, observation) {
   const current = observation.desired;
   const visible = observation.visible;

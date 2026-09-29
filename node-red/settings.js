@@ -14,7 +14,7 @@ function loadEdgeState() {
 
 // The edge state (last settled weight of every shelf, fridge states) survives a restart through
 // this file. It used to be written on every reading, and each write serialised every shelf ever
-// seen, so the edge slowed down as the number of shelves grew and sent events in bursts (6.4HD E3).
+// seen, so the edge slowed down as the number of shelves grew and sent events in bursts during the load tests.
 // Now it is written at most once a second, with the latest state; a crash loses at most one second
 // of debounce memory, which only delays the next settled reading.
 const SAVE_INTERVAL_MS = Number(process.env.EDGE_STATE_SAVE_MS || 1000);

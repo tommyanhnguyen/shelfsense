@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const { decide, estimate, modelTarget, readSettings } = require('../src/scaler');
 
-// A one-second queue model of the 6.3D burst: 205.5 events/s for 90 s, 41.3 events/s per worker,
+// A one-second queue model of the v1.0 burst: 205.5 events/s for 90 s, 41.3 events/s per worker,
 // 120 s for a new worker to start. With the old step policy it drains in 342 s, which matches the
 // 334 s measured on AWS, so the model is a fair place to compare policies before using the lab.
 function simulate({ policy, source, rate = 205.5, duration = 90, mu = 41.3, bootSeconds = 120, max = 6 }) {
@@ -130,7 +130,7 @@ test('settings reject unknown policies and a minimum above the maximum', () => {
   assert.equal(readSettings({ SCALER_SOURCE: 'cloudwatch' }).intervalSeconds, 60);
 });
 
-test('queue model: the step policy on CloudWatch matches the 6.3D run, and each lever helps', () => {
+test('queue model: the step policy on CloudWatch matches the v1.0 run, and each lever helps', () => {
   const baseline = simulate({ policy: 'step', source: 'cloudwatch', max: 4 });
   const fastDetection = simulate({ policy: 'step', source: 'sqs', max: 4 });
   const rateModel = simulate({ policy: 'model', source: 'cloudwatch' });
