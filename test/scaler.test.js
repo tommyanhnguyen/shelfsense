@@ -112,6 +112,17 @@ test('worker rate is learned only while the workers are busy', () => {
   assert.equal(idle.mu, 40);
 });
 
+test('worker rate is not learned from messages a concurrent worker is merely holding', () => {
+  // Logged at 16:04 in the A+B+C run: one worker at C = 8 holds 17 messages and has spare capacity.
+  const settings = readSettings({ SCALER_MU: '207' });
+  const holding = estimate(settings, { mu: 207, previous: { at: 0, visible: 11, inFlight: 17, backlog: 28, inService: 1 } },
+    { at: 10000, visible: 0, inFlight: 0, backlog: 0, applied: 787, inService: 1 });
+  assert.equal(holding.mu, 207);
+  const saturated = estimate(settings, { mu: 207, previous: { at: 0, visible: 900, inFlight: 16, backlog: 916, inService: 1 } },
+    { at: 10000, visible: 700, inFlight: 16, backlog: 716, applied: 2100, inService: 1 });
+  assert.equal(saturated.mu > 207, true);
+});
+
 test('settings reject unknown policies and a minimum above the maximum', () => {
   assert.throws(() => readSettings({ SCALER_POLICY: 'guess' }));
   assert.throws(() => readSettings({ SCALER_SOURCE: 'email' }));

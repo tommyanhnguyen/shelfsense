@@ -81,7 +81,12 @@ function estimate(settings, state, observation) {
       if (observation.arrivalRate === undefined) {
         lambda = Math.max(0, (observation.applied + observation.backlog - previous.backlog) / seconds);
       }
-      const busy = previous.backlog > previous.inService * settings.busyPerWorker;
+      // Busy means messages were still waiting (not yet taken by a worker) at both ends of the
+      // interval. The backlog alone is not enough: at C = 8 a worker holds up to 16 messages in
+      // flight while it still has spare capacity, which made the learned rate far too low.
+      const waiting = sample => sample.visible ?? sample.backlog;
+      const busy = waiting(previous) > previous.inService * settings.busyPerWorker
+        && waiting(observation) > observation.inService * settings.busyPerWorker;
       const settled = observation.at - (state.lastChangeAt ?? -Infinity) > settings.warmupSeconds * 1000;
       if (busy && settled && observation.inService > 0 && observation.applied > 0) {
         const perWorker = observation.applied / seconds / observation.inService;
