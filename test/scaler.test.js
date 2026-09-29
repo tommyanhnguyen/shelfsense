@@ -86,6 +86,22 @@ test('model policy waits for three low checks before it scales in', () => {
   assert.deepEqual(reasons, [4, 4, 1]);
 });
 
+test('model policy does not scale in until new workers have had time to start', () => {
+  const settings = readSettings({ SCALER_MU: '40' });
+  let state = { mu: 40, lastScaleOutAt: 0 };
+  const targets = [];
+  for (let tick = 1; tick <= 40; tick += 1) {
+    const decision = decide(settings, state, { at: tick * 10000, visible: 0, inFlight: 0, backlog: 0, applied: 0,
+      inService: 4, desired: 4 });
+    state = decision.state;
+    targets.push(decision.target);
+  }
+  // Held for the 300 s cooldown after the scale out, then three low checks, then down to 1.
+  assert.equal(targets.slice(0, 29).every(target => target === 4), true);
+  assert.equal(targets.includes(1), true);
+  assert.equal(targets.indexOf(1) >= 30, true);
+});
+
 test('worker rate is learned only while the workers are busy', () => {
   const settings = readSettings({ SCALER_MU: '40' });
   const busy = estimate(settings, { mu: 40, previous: { at: 0, backlog: 5000, inService: 2 } },

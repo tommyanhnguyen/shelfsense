@@ -312,3 +312,29 @@ test('shelf debounce uses sensor time while latency uses wall time', async () =>
   assert.equal(edge.processShelf({ ...reading(2000), ts: 100 }), null);
   assert.equal(edge.processShelf({ ...reading(2000), ts: 1000 }).data.delta, -8);
 });
+
+test('edge state is saved at most once a second, with the latest state', async () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'edge-state-')), 'state.json');
+  const previous = process.env.EDGE_STATE_FILE;
+  process.env.EDGE_STATE_FILE = file;
+  delete require.cache[require.resolve('../node-red/settings')];
+  const fresh = require('../node-red/settings');
+  let snapshots = 0;
+  const processor = { value: 0, snapshot() { snapshots += 1; return { value: this.value }; } };
+  for (let reading = 1; reading <= 200; reading += 1) {
+    processor.value = reading;
+    fresh.functionGlobalContext.saveEdgeState(processor);
+  }
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(snapshots, 1, 'one write for 200 readings');
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { value: 200 });
+  processor.value = 201;
+  fresh.functionGlobalContext.saveEdgeState(processor);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(snapshots, 1, 'the next write waits for the one second interval');
+  await new Promise(resolve => setTimeout(resolve, 1100));
+  assert.equal(snapshots, 2);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { value: 201 });
+  if (previous === undefined) delete process.env.EDGE_STATE_FILE; else process.env.EDGE_STATE_FILE = previous;
+  delete require.cache[require.resolve('../node-red/settings')];
+});

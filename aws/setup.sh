@@ -303,6 +303,8 @@ cmd_workers() {
       --vpc-zone-identifier "$subnet_a,$subnet_b" --default-instance-warmup 60 \
       --tags "Key=Project,Value=$P,PropagateAtLaunch=true"
   fi
+  # On scale in, remove the newest instance: it may still be starting, while the oldest is warm.
+  aws autoscaling update-auto-scaling-group --auto-scaling-group-name "$P-inventory" --termination-policies NewestInstance
   aws autoscaling enable-metrics-collection --auto-scaling-group-name "$P-inventory" --granularity 1Minute
   ok "Auto Scaling Group $P-inventory: min 1, max 1 until you run ./aws/setup.sh scale"
   high=$(aws autoscaling put-scaling-policy --auto-scaling-group-name "$P-inventory" --policy-name "$P-scale-out" \
@@ -549,7 +551,8 @@ cmd_scaler() {
     *) fail "mode must be A, B, AB, dryrun, off, check or log" ;;
   esac
   aws cloudwatch disable-alarm-actions --alarm-names "$P-backlog-high" "$P-backlog-low"
-  aws autoscaling update-auto-scaling-group --auto-scaling-group-name "$group" --min-size 1 --max-size "$max"
+  aws autoscaling update-auto-scaling-group --auto-scaling-group-name "$group" --min-size 1 --max-size "$max" \
+    --termination-policies NewestInstance
   on core "sudo docker rm -f scaler >/dev/null 2>&1; sudo docker run -d --name scaler --restart unless-stopped \
     --env-file /opt/shelfsense/app.env -e SCALER_SOURCE=$source -e SCALER_POLICY=$policy -e SCALER_MAX=$max \
     -e SCALER_MU=$mu -e SCALER_DRY_RUN=$dry -e SCALER_GROUP=$group shelfsense node src/scaler.js >/dev/null"

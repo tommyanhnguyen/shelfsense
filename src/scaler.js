@@ -24,10 +24,11 @@ const DEFAULTS = {
   mu: 40,
   drainSeconds: 60,
   scaleInTicks: 3,
-  warmupSeconds: 90,
+  warmupSeconds: 180,
   alpha: 0.3,
   busyPerWorker: 20,
   scaleInBacklog: 100,
+  scaleInCooldownSeconds: 300,
   stepHigh: 300,
   stepHigher: 2300,
   stepLow: 20,
@@ -99,7 +100,16 @@ function decideModel(settings, state, observation) {
   const capped = needed > settings.max ? ` (needs ${needed}, capped at ${settings.max})` : '';
   const facts = { lambda: rates.lambda, mu: rates.mu, needed };
   if (target > current) {
-    return { ...facts, target, reason: 'scale out' + capped, state: { ...next, lowTicks: 0, lastChangeAt: observation.at } };
+    return { ...facts, target, reason: 'scale out' + capped,
+      state: { ...next, lowTicks: 0, lastChangeAt: observation.at, lastScaleOutAt: observation.at } };
+  }
+  // Scale out fast, scale in slowly. A new worker needs about three minutes to start, and the
+  // 6.4HD E3 runs showed that scaling in sooner removed workers before they had done any work, then
+  // added them again on the next burst.
+  const sinceScaleOut = observation.at - (state.lastScaleOutAt ?? -Infinity);
+  if (target < current && sinceScaleOut < settings.scaleInCooldownSeconds * 1000) {
+    return { ...facts, target: current, reason: 'hold, workers added less than '
+      + settings.scaleInCooldownSeconds + ' s ago', state: { ...next, lowTicks: 0 } };
   }
   // Scale in only once the queue is nearly empty. Shrinking while a backlog remains would slow the
   // tail of the drain, because the model always plans to finish the rest in drainSeconds.
